@@ -10,7 +10,17 @@ This repo provides a customizable control plane that allows you to:
 - Extend your Agents with [Browser Run](https://developers.cloudflare.com/browser-run), [Email](https://developers.cloudflare.com/email-service/), and any other custom tools using the [Cloudflare Developer Platform](https://workers.cloudflare.com/products#all)
  your needs.
 
-Follow the [Onboarding Guide](#onboarding-guide) to get started.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/claude-managed-agents)
+
+The button forks this repo into your GitHub account, provisions the D1
+database, KV namespaces, R2 bucket, and Durable Objects automatically,
+prompts you for the required secrets, and deploys the Worker via
+Workers Builds. After the deploy finishes, follow steps 2 and 6 of the
+[Onboarding Guide](#onboarding-guide) to wire up the Anthropic webhook
+and (optionally) the extras.
+
+If you'd rather deploy manually, the [Onboarding Guide](#onboarding-guide)
+walks through it from scratch.
 
 > **You need a Paid or Enterprise Cloudflare account to run Managed Agents.**
 > [Cloudflare Containers](https://developers.cloudflare.com/containers/)
@@ -57,15 +67,19 @@ meant as a starting point.
 
 Note: order matters
 
-**1. Initial deploy.**
+**1. Initial deploy.** Either click the **Deploy to Cloudflare** button
+at the top (recommended — handles steps 1, 3, 4, and 5 in one go) or
+deploy manually:
 
 ```sh
 npm run deploy
 ```
 
-This builds your base sandbox container image (Docker required) and deploys the Worker.
-Wrangler auto-provisions the D1 database, KV namespaces, and R2 bucket declared
-in `wrangler.jsonc` on first deploy (requires wrangler 4.45+; see
+`npm run deploy` builds your base sandbox container image (Docker
+required), deploys the Worker, and applies D1 migrations via the
+`postdeploy` hook. Wrangler auto-provisions the D1 database, KV
+namespaces, and R2 bucket declared in `wrangler.jsonc` on first deploy
+(requires wrangler 4.45+; see
 [auto-provisioning](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning),
 currently open beta). The worker won't function until you finish the
 remaining steps, but the deploy gives you the
@@ -89,35 +103,37 @@ You will need the following values:
   events to your Worker; we verify the signature before doing anything
   with them.
 
-**3. Set the secrets.**
+**3. Set the secrets.** If you used the Deploy to Cloudflare button,
+you already filled in `ENVIRONMENT_ID`, `ANTHROPIC_ENVIRONMENT_KEY`,
+and `ANTHROPIC_API_KEY` during the form flow. You still need to set
+`WEBHOOK_SECRET` after step 2 (the webhook didn't exist when you
+deployed).
 
-Locally:
+```sh
+npx wrangler secret put WEBHOOK_SECRET
+```
+
+For a full local + production setup, copy the template and edit:
 
 ```sh
 cp .dev.vars.example .dev.vars
 ```
 
-Fill in the values above in `.dev.vars`.
-
-In production:
+In production, every entry in `.dev.vars` needs a matching
+`wrangler secret put NAME`. The four core secrets are:
 
 ```sh
+npx wrangler secret put ENVIRONMENT_ID
 npx wrangler secret put ANTHROPIC_ENVIRONMENT_KEY
 npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put ENVIRONMENT_ID
 npx wrangler secret put WEBHOOK_SECRET
 ```
 
-**4. Apply D1 migrations.** The database was auto-created in step 1
-but is empty.
-
-For production:
-
-```sh
-npm run db:migrate:remote   # production
-```
-
-For local dev:
+**4. Apply D1 migrations.** The `postdeploy` hook runs
+`wrangler d1 migrations apply DB --remote` automatically after every
+`npm run deploy` (including the Deploy to Cloudflare button's
+deploy), so there's nothing to do here for production. For local
+dev:
 
 ```sh
 npm run db:migrate          # local
@@ -126,7 +142,10 @@ npm run db:migrate          # local
 **5. Provision R2 snapshot credentials.**
 
 The R2 bucket itself was auto-created in step 1. The presigned-URL path
-used in production still needs an access key.
+used in production still needs an access key. If you provided
+`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` /
+`BACKUP_BUCKET_NAME` / `CLOUDFLARE_ACCOUNT_ID` during the Deploy
+button flow, skip ahead.
 
 This is required unless you're exclusively using Isolate sandboxes
 or running stateless agent sessions. Isolate sessions persist through
@@ -151,14 +170,16 @@ npx wrangler secret put CLOUDFLARE_ACCOUNT_ID # found in your dashboard URL
 See [Snapshots & state persistence](./docs/snapshots-and-state-persistence.md)
 for more information.
 
-**6. (Optional) Turn on the extras.** Each is opt-in; skip what you don't need.
+**6. (Optional) Turn on the extras.** Browser Rendering, Workers AI,
+and Email send are wired up out of the box — disable in `wrangler.jsonc`
+if you don't want them. VPC bindings are opt-in.
 
-| Capability | Bindings to add | Secrets to add | Setup steps |
-|---|---|---|---|
-| Browser Rendering tools | uncomment `browser` in `wrangler.jsonc` | `CLOUDFLARE_API_TOKEN` (for REST tools) | none |
-| Workers AI image gen | uncomment `ai` in `wrangler.jsonc` | none | None |
-| Email send + inbox | uncomment `send_email` in `wrangler.jsonc`; set `EMAIL_DOMAIN` + `EMAIL_FROM` (Deploy to Cloudflare prompts for these, or `vars` in `wrangler.jsonc` locally) | none | [Email docs](./docs/agent-email.md) |
-| VPC private services | add `vpc_services` blocks in `wrangler.jsonc` | none | [Workers VPC docs](./docs/connecting-to-private-services.md) |
+| Capability | Default | Bindings | Secrets to add | Setup steps |
+|---|---|---|---|---|
+| Browser Rendering tools | on | `browser` in `wrangler.jsonc` | `CLOUDFLARE_API_TOKEN` (for REST tools) | none |
+| Workers AI image gen | on | `ai` in `wrangler.jsonc` | none | none |
+| Email send + inbox | on | `send_email` in `wrangler.jsonc`; set `EMAIL_DOMAIN` + `EMAIL_FROM` (Deploy to Cloudflare prompts for these, or `vars` in `wrangler.jsonc` locally) | none | [Email docs](./docs/agent-email.md) |
+| VPC private services | off | add `vpc_services` blocks in `wrangler.jsonc` | none | [Workers VPC docs](./docs/connecting-to-private-services.md) |
 
 **7. Visit the dashboard.** `https://<your-worker>.workers.dev/`. Create an
 agent (the form lets you pick MicroVM or Isolate backend), kick off a

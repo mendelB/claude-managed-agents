@@ -10,14 +10,11 @@
   // Non-secret vars. Secrets go through `wrangler secret put`. Anything you
   // put here is visible in the dashboard and stored in the deploy bundle.
   //
-  // EMAIL_DOMAIN / EMAIL_FROM are intentionally blank in the committed
-  // file so a fork-and-deploy doesn't ship the maintainer's zone. Both
-  // are promoted to `package.json#cloudflare.deployVariables`, which
-  // means the Deploy to Cloudflare button prompts for them and
-  // `scripts/apply-container-config.mjs` (run on `prebuild`) writes the
-  // operator's values back into this block before deploy. Local devs can
-  // either set the env vars before `npm run deploy` or edit the strings
-  // below directly.
+  // EMAIL_DOMAIN / EMAIL_FROM are intentionally blank so a fork-and-deploy
+  // doesn't ship the maintainer's zone. The Deploy to Cloudflare button
+  // prompts for them at setup time (descriptions live in
+  // `package.json#cloudflare.bindings`). Local devs can either set the
+  // env vars before `npm run deploy` or edit the strings below directly.
   //
   // EMAIL_DOMAIN: zone the per-session inbox addresses are minted under.
   // Set to your verified Email Routing zone (e.g. `agents.example.com`).
