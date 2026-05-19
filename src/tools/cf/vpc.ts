@@ -107,8 +107,8 @@ export function buildCfCallServiceSchema(env: Env): {
 function zCallServiceSchema(enumValues: [string, ...string[]]) {
   // VPC binding names in `wrangler.jsonc` are uppercase by convention,
   // and the runtime env lookup is exact-match. Models routinely mirror
-  // the user's natural-language casing though (e.g. "respondy" because
-  // the user said "respondy") and get rejected by the enum — a wasted
+  // the user's natural-language casing though (e.g. "service" because
+  // the user said "service") and get rejected by the enum — a wasted
   // turn that just retries with the right case. Normalise to the
   // canonical binding name before the enum check so any casing the
   // model emits round-trips to the real env property.
@@ -118,13 +118,11 @@ function zCallServiceSchema(enumValues: [string, ...string[]]) {
       .preprocess(
         (val) =>
           typeof val === "string"
-            ? canonical.get(val.toLowerCase()) ?? val
+            ? (canonical.get(val.toLowerCase()) ?? val)
             : val,
         z.enum(enumValues),
       )
-      .describe(
-        "Name of the VPC service binding to call (case-insensitive).",
-      ),
+      .describe("Name of the VPC service binding to call (case-insensitive)."),
     path: z
       .string()
       .describe(
