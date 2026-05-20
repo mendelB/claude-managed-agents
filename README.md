@@ -75,8 +75,7 @@ meant as a starting point.
 Note: order matters
 
 **1. Initial deploy.** Either click the **Deploy to Cloudflare** button
-at the top (recommended — handles steps 1, 3, 4, and 5 in one go) or
-deploy manually:
+at the top to initiate a git-based deploy process or deploy via your terminal:
 
 ```sh
 npm run deploy
