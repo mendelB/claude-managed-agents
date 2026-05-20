@@ -29,13 +29,24 @@
 // itself needs the same credentials, so this isn't an extra burden.
 
 import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wranglerPath = resolve(here, "..", "wrangler.jsonc");
+const repoRoot = resolve(here, "..");
+const wranglerPath = resolve(repoRoot, "wrangler.jsonc");
+
+// Locate the wrangler binary explicitly — see ensure-kv.mjs for the
+// rationale (npx --no-install can't find a project-local wrangler
+// when cwd is /tmp in Workers Builds).
+function resolveWranglerBin() {
+  const local = resolve(repoRoot, "node_modules", ".bin", "wrangler");
+  if (existsSync(local)) return local;
+  return "wrangler";
+}
+const wranglerBin = resolveWranglerBin();
 
 // `wrangler d1 list` validates the project's wrangler.jsonc before
 // running, which fails when ensure-kv.mjs hasn't yet populated the
@@ -126,7 +137,7 @@ if (!isWorkersCi && currentDbId.length > 0) {
 // concrete action instead of a stack trace.
 function runWrangler(args, options = {}) {
   try {
-    return execSync(`npx --no-install wrangler ${args}`, {
+    return execSync(`"${wranglerBin}" ${args}`, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "inherit"],
       cwd: scratchDir,

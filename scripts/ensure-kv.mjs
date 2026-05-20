@@ -32,13 +32,30 @@
 // needs the same credentials, so this isn't an extra burden.
 
 import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wranglerPath = resolve(here, "..", "wrangler.jsonc");
+const repoRoot = resolve(here, "..");
+const wranglerPath = resolve(repoRoot, "wrangler.jsonc");
+
+// Locate the wrangler binary explicitly. `npx --no-install wrangler`
+// is unreliable in CI when the script's cwd is /tmp (e.g. Workers
+// Builds with `bun install`): npx walks up from cwd looking for
+// node_modules, finds none, and exits before we can reach the
+// project's local install. Pointing at node_modules/.bin/wrangler
+// directly sidesteps the resolution entirely.
+function resolveWranglerBin() {
+  const local = resolve(repoRoot, "node_modules", ".bin", "wrangler");
+  if (existsSync(local)) return local;
+  // Fall back to PATH lookup. If wrangler is globally installed (rare
+  // but possible on a maintainer's machine), this still works. If it
+  // isn't, the spawn will fail and runWrangler() prints a hint.
+  return "wrangler";
+}
+const wranglerBin = resolveWranglerBin();
 
 // JSONC stripper — mirrors scripts/ensure-d1.mjs. We only parse for
 // reads; writes go through targeted regex swaps so comments survive.
@@ -139,7 +156,7 @@ const scratchDir = mkdtempSync(join(tmpdir(), "ensure-kv-"));
 // command).
 function runWrangler(args, options = {}) {
   try {
-    return execSync(`npx --no-install wrangler ${args}`, {
+    return execSync(`"${wranglerBin}" ${args}`, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "inherit"],
       cwd: scratchDir,

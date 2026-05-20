@@ -12,6 +12,13 @@ This repo provides a customizable control plane that allows you to:
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/claude-managed-agents)
 
+> ⚠️ **You must rename one of the two KV namespaces in the deploy
+> form.** The "Configure resources" step pre-fills both `SECRETS`
+> and `EGRESS_POLICIES` with the same default name, and the deploy
+> will fail with `Cannot provision a KV Namespace ... because it
+> already exists` if you don't change one. Suggested names:
+> `<worker-name>-secrets` and `<worker-name>-egress-policies`.
+
 The button forks this repo into your GitHub account, provisions the D1
 database, KV namespaces, R2 bucket, and Durable Objects automatically,
 prompts you for the required secrets, and deploys the Worker via
@@ -245,6 +252,17 @@ empty `id` / `database_id` placeholders in `wrangler.jsonc`:
   `name` from `wrangler.jsonc` at build time. Just remember to use the
   rewritten URL (`https://<your-chosen-name>.<account>.workers.dev`)
   when configuring the Anthropic webhook in step 2.
+- **Deploy to Cloudflare form: you must rename at least one of the
+  two KV namespaces.** This repo declares two KV namespaces
+  (`SECRETS` and `EGRESS_POLICIES`) and the form's "Configure
+  resources" step pre-fills both name inputs with the worker name,
+  with no binding suffix — so the first create succeeds and the
+  second fails with `Cannot provision a KV Namespace with the title
+  "<worker-name>" because it already exists`. Before clicking deploy,
+  edit both inputs to be distinct, e.g. `<worker-name>-secrets` and
+  `<worker-name>-egress-policies`. `ensure-kv.mjs` will then
+  fuzzy-match those names back to the right bindings on every
+  subsequent build.
 
 ## Going deeper
 
