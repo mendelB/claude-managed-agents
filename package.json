@@ -21,7 +21,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.9.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.7",
     "@types/node": "^24.12.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
