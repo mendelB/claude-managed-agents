@@ -8,6 +8,7 @@ import type { CompiledPolicy } from "../egress/types";
 import { buildCfTools } from "../tools/cf";
 import { runCustomToolDispatcher } from "../isolate/custom-dispatch";
 import { isolateBrowserTools } from "../isolate/tools";
+import { buildMicrovmStockTools } from "./stock-tools";
 
 // How long the MicroVM container stays alive after the agent goes idle
 // before the base Container class snapshots /workspace and stops it.
@@ -139,6 +140,30 @@ export class Sandbox extends SandboxBase<Env> {
 
   async isLive(): Promise<boolean> {
     return this.ctx.container?.running ?? false;
+  }
+
+  // Renew the container's activity timer mid-tool-call. Called from
+  // the custom-tool dispatcher's `onInFlightChange` hook whenever the
+  // in-flight count crosses into > 0 so a long-running `bash` doesn't
+  // get its container reaped under `SESSION_IDLE_TTL` while it's still
+  // doing useful work. Best-effort — failure is swallowed by the
+  // caller because the standard activity path will eventually catch up.
+  //
+  // `setEnvVars({})` is the cheapest no-op RPC the Sandbox SDK exposes
+  // that still touches the container's activity tracker. We can't
+  // simply skip this and rely on the in-flight tool's own RPC because
+  // tools that hand work off to long-running subprocesses (npm install
+  // with output we're not streaming) can stop producing RPC traffic
+  // for multi-minute stretches.
+  async renewContainerActivity(): Promise<void> {
+    if (!(await this.isLive())) return;
+    try {
+      await this.setEnvVars({});
+    } catch (error) {
+      console.warn(
+        `[sandbox] activity renewal failed: ${toErrorMessage(error)}`,
+      );
+    }
   }
 
   async applyPolicy(policy: CompiledPolicy | null): Promise<void> {
@@ -491,9 +516,19 @@ export class Sandbox extends SandboxBase<Env> {
       }
     }
 
-    if (tools.length === 0) {
+    // Stock toolset handlers (bash/read/write/edit/glob/grep). These
+    // answer `agent.tool_use` events directly from the DO via the
+    // Sandbox SDK, so a self-hosted environment that doesn't run
+    // `ant beta:worker run` (or runs it but it doesn't pick up the work
+    // for whatever reason) still gets its built-in `write` calls answered
+    // instead of hanging on `session.status_idle.stop_reason.requires_action`.
+    // The handlers exec into the same container the user's bash commands
+    // would target, so behaviour matches what the model expects.
+    const stockTools = buildMicrovmStockTools(this);
+
+    if (tools.length === 0 && stockTools.length === 0) {
       console.log(
-        `[sandbox] no custom tools available for session=${opts.sessionId} — dispatcher not started`,
+        `[sandbox] no tools available for session=${opts.sessionId} — dispatcher not started`,
       );
       this.customDispatchCtrl = undefined;
       return;
@@ -513,21 +548,38 @@ export class Sandbox extends SandboxBase<Env> {
     });
 
     console.log(
-      `[sandbox] custom-tool dispatcher starting session=${opts.sessionId} tools=${tools
+      `[sandbox] dispatcher starting session=${opts.sessionId} custom=${tools
         .map((t) => t.name)
-        .join(",")}`,
+        .join(",")} stock=${stockTools.map((t) => t.name).join(",")}`,
     );
 
     // Detached run. The DO stays alive while the dispatcher polls;
     // when `ctrl.signal` aborts (manual stop, activity-expired, or
     // another dispatch on the same session restarts us) the dispatcher
     // returns and we clear the controller.
+    //
+    // `onInFlightChange` fires every time a tool starts or finishes.
+    // While the count is > 0 we bump the container's activity timer
+    // so a long-running `bash` (npm install, test suite) can't trigger
+    // the SESSION_IDLE_TTL reaper mid-call. setEnvVars() is a cheap
+    // round-trip the SDK uses as its activity-renewal pulse; we pass
+    // an empty object so the actual env stays unchanged.
     this.ctx.waitUntil(
       runCustomToolDispatcher({
         client,
         sessionId: opts.sessionId,
         tools,
+        stockTools,
         signal: ctrl.signal,
+        onInFlightChange: (count) => {
+          if (count > 0) {
+            void this.renewContainerActivity().catch(() => {
+              // Best-effort. The dispatcher logs detailed errors;
+              // failure to renew just means we fall back to the
+              // standard activity-expired path.
+            });
+          }
+        },
       })
         .catch((error) => {
           console.error(
