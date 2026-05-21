@@ -35,6 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # before any tool runs (see the 0512 self-hosted integration guide).
 # ---------------------------------------------------------------------------
 ARG ANT_VERSION=1.9.1
+# TARGETARCH is a BuildKit-provided global ARG (amd64 / arm64), but it has to
+# be redeclared inside the stage before it expands in `RUN`.
+ARG TARGETARCH
 RUN curl -fsSL "https://github.com/anthropics/anthropic-cli/releases/download/v${ANT_VERSION}/ant_${ANT_VERSION}_linux_${TARGETARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin ant \
  && chmod +x /usr/local/bin/ant
