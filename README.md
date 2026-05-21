@@ -231,7 +231,7 @@ the `r2_buckets` block from `wrangler.jsonc`).
 Anyone running the MicroVM backend should treat this as core
 onboarding.
 
-[Mint an R2 access key](https://dash.cloudflare.com/r2/api-tokens/create?type=user)
+[Mint an R2 access key](https://dash.cloudflare.com?to=/:account/r2/api-tokens/create?type=user)
 with read+write on the `claude-managed-agents-snapshots` bucket
 (Cloudflare dashboard → R2 → Manage R2 API Tokens → Create token),
 copy the Access Key ID and Secret Access Key, then push the
