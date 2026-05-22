@@ -7,32 +7,34 @@ import { ANTHROPIC_BETA } from "../anthropic";
 // (src/microvm/sandbox.ts); the Isolate path runs the SDK's
 // `SessionToolRunner` directly, which already covers both kinds.
 //
-// Historically this dispatcher only handled `agent.custom_tool_use`
-// because we relied on `ant beta:worker run` inside the container to
-// answer the stock toolset (bash / read / write / edit / glob / grep).
-// That assumption broke on self-hosted-only environments: the
-// work-queue path no longer surfaces tool calls, and built-in `write`
-// calls hung indefinitely on
-// `session.status_idle.stop_reason.requires_action` because nothing on
-// the worker side was posting `user.tool_result`.
+// On the MicroVM backend this dispatcher is one half of the
+// "EnvironmentWorker substitute" — the other half is the work-item
+// heartbeat loop (src/heartbeat.ts), which holds the lease while the
+// dispatcher runs. The Sandbox DO composes both so the worker-side
+// architecture matches what the Anthropic self-hosted-sandboxes guide
+// recommends (one owner per session, claim → dispatch → stop), just
+// hand-rolled because the SDK's `EnvironmentWorker.handleItem` helper
+// requires Node and can't run in a Worker DO.
 //
-// The dispatcher now accepts a parallel `stockTools` registry. When an
-// `agent.tool_use` event arrives, we look the name up there, run the
-// handler (which exec's inside the container via the Sandbox SDK — see
-// src/microvm/stock-tools.ts), and post `user.tool_result`.
-// `agent.custom_tool_use` continues to flow through the `tools`
-// registry with `user.custom_tool_result`. The two registries stay
-// separate so a stock name (`write`) can't accidentally answer a custom
-// call and vice versa.
+// The dispatcher accepts two parallel tool registries — `tools` for
+// `agent.custom_tool_use` answered with `user.custom_tool_result`,
+// and `stockTools` for `agent.tool_use` answered with
+// `user.tool_result`. Keeping them separate avoids a stock name
+// (`write`) accidentally answering a custom call (and vice versa) when
+// the model emits the wrong event kind.
 //
 // What this dispatcher gives the MicroVM DO that the SDK's
 // SessionToolRunner doesn't:
-//  1. Reconcile across DO eviction — we walk session events on every
-//     stream reconnect and pre-answer tool calls that arrived while we
-//     were asleep. The SDK runner reconciles per-connection but
+//  1. Reconcile across DO eviction — walks session events on every
+//     stream reconnect and pre-answers tool calls that arrived while
+//     we were asleep. The SDK runner reconciles per-connection but
 //     doesn't survive a DO restart.
 //  2. `onInFlightChange` — exposes the in-flight count so the caller
 //     can renew the container's activity timer during long tool runs.
+//
+// Lifecycle ownership: the heartbeat loop and the dispatcher share an
+// AbortController, so a `state: stopping` from the platform or a
+// dispatcher-side error tears down both together.
 
 const TOOL_TIMEOUT_MS = 120_000;
 const STREAM_BACKOFF_START_MS = 500;

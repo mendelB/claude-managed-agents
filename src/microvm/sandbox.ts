@@ -9,6 +9,8 @@ import { buildCfTools } from "../tools/cf";
 import { runCustomToolDispatcher } from "../isolate/custom-dispatch";
 import { isolateBrowserTools } from "../isolate/tools";
 import { buildMicrovmStockTools } from "./stock-tools";
+import { runHeartbeatLoop } from "../heartbeat";
+import { ANTHROPIC_BETA } from "../anthropic";
 
 // How long the MicroVM container stays alive after the agent goes idle
 // before the base Container class snapshots /workspace and stops it.
@@ -44,22 +46,53 @@ export interface DispatchOpts {
   baseURL: string;
 }
 
-// One Sandbox per session. The image entrypoint is `ant beta:worker run …`,
-// so the container runs its own work loop once started — we just hand it the
-// ANTHROPIC_* env vars from the polled work item via `start({ envVars })`.
+// One Sandbox per session. The container is started by the Sandbox SDK
+// (its own entrypoint serves the platform's HTTP API for exec /
+// readFile / writeFile / etc.) and is then driven entirely from this
+// DO via that API — there is no in-container worker process.
 //
-// Two dispatchers run against each session, on disjoint event types:
+// How we differ from the Anthropic self-hosted-sandboxes guide
+// ------------------------------------------------------------
+// The recommended worker-side architecture
+// (https://platform.claude.com/docs/en/managed-agents/self-hosted-sandboxes#environment-worker)
+// for a webhook-triggered setup is to use the SDK's
+// `EnvironmentWorker.handleItem()` per claimed work item, or for the
+// always-on / container-per-session variant, to use `ant beta:worker
+// run` as the container's `ENTRYPOINT`. Both helpers own claim →
+// skills download → tool dispatch → result post → stop in one
+// process.
 //
-//   1. `ant beta:worker run` inside the container — handles `agent.tool_use`
-//      events emitted by Anthropic's stock toolset (bash / read / write /
-//      edit / glob / grep / web_fetch / web_search). Renamed from
-//      `ant worker dispatch` in the 0.96 SDK / ant 1.8 release.
-//   2. `runCustomToolDispatcher` running here in the DO — handles
-//      `agent.custom_tool_use` events for the cf_* family and any
-//      user-defined tools from `src/tools/custom-tools.ts`. The handlers
-//      close over the Worker's `env`, so tools have direct access to
-//      KV, R2, D1, AI, VPC services, Email Routing, etc., without the
-//      container needing a network round-trip back to the Worker.
+// Neither helper runs in a Cloudflare Worker Durable Object: the SDK
+// helper requires Node + `/bin/bash`; `ant beta:worker run` is a
+// separate process. So we own the equivalent protocol ourselves and
+// compose three pieces inside the DO:
+//
+//   1. `runCustomToolDispatcher` (src/isolate/custom-dispatch.ts) —
+//      reads the session event stream and answers BOTH
+//      `agent.tool_use` (via `stockTools` built by
+//      `buildMicrovmStockTools` — they `exec`/`readFile`/`writeFile`
+//      inside the container) AND `agent.custom_tool_use` (via the
+//      worker-binding-backed `tools` — cf_* family + user customs).
+//   2. `runHeartbeatLoop` (src/heartbeat.ts) — holds the work-item
+//      lease the docs say `EnvironmentWorker` would hold for us, and
+//      signals the dispatcher to wind down on `state: stopping`.
+//   3. `work.stop({ force: true })` on exit — the equivalent of
+//      `handleItem()` exiting cleanly.
+//
+// We previously ran `ant beta:worker run` as a child process inside
+// the container alongside this dispatcher. The two were supposedly on
+// disjoint event types (the in-container CLI handled `agent.tool_use`,
+// the DO handled `agent.custom_tool_use`), but on self-hosted-only
+// envs the work-queue path the CLI polls stopped surfacing tool
+// turns, so every built-in `write` hung indefinitely. Removing it
+// gives us one clear owner per session and avoids the dual-claim race
+// where both processes try to heartbeat the same work item.
+//
+// Skills download is still a TODO — same limitation as the Isolate
+// runner (see src/isolate/runner.ts around DISPATCHER_FIBER). The
+// SDK's `setupSkills` uses Node `fs`/`path` directly; a
+// Workers-compatible variant (`sandbox.writeFile` into
+// `/workspace/skills/<name>/`) would slot in here.
 //
 // Egress proxy:
 //   - `outbound` is the static catch-all fall-through. It MUST be defined
@@ -390,24 +423,13 @@ export class Sandbox extends SandboxBase<Env> {
       );
     }
 
-    // Build the env var bag for the container.
-    //
-    // Under the 0.96 SDK / ant 1.8 release the environment key is the
-    // single credential for the whole worker flow — `ant beta:worker run`
-    // uses it to authenticate poll/ack/heartbeat/force-stop AND the
-    // session event stream AND skill download. There is no separate
-    // per-work-item session token any more. The CLI's run env contract
-    // is `ANTHROPIC_{SESSION_ID,ENVIRONMENT_KEY,WORK_ID,ENVIRONMENT_ID,BASE_URL}`.
-    //
-    // We deliberately do NOT forward `ANTHROPIC_API_KEY` here. The Anthropic
-    // SDK's `readEnv('ANTHROPIC_API_KEY')` fallback auto-fills `apiKey`
-    // when the constructor receives only `authToken`, and the
-    // managed-agents server rejects requests that carry both
-    // `Authorization: Bearer` and `x-api-key` with 401. With both vars in
-    // the container's `process.env`, `ant beta:worker run` ends up
-    // sending the rejected combo and every per-session call 401s.
-    // Anything user-authored that needs an API key should plumb it
-    // through a differently-named env var.
+    // Container-side env vars. The container itself doesn't run a
+    // worker process any more (see the class-level comment), but bash
+    // tool calls invoked through `stock-tools.ts` inherit these via
+    // `setEnvVars`, so user-authored shell snippets that consult
+    // `$ANTHROPIC_SESSION_ID` still work. We deliberately do NOT
+    // forward `ANTHROPIC_API_KEY` — that would leak an
+    // organization-scoped credential into every bash tool call.
     const envVars: Record<string, string> = {
       ANTHROPIC_SESSION_ID: opts.sessionId,
       ANTHROPIC_ENVIRONMENT_KEY: this.env.ANTHROPIC_ENVIRONMENT_KEY,
@@ -420,16 +442,11 @@ export class Sandbox extends SandboxBase<Env> {
       `[sandbox] dispatch session=${opts.sessionId} work=${opts.workId} envKeys=${Object.keys(envVars).join(",")}`,
     );
 
-    // Boot the sandbox runtime container (port 3000) AND restore the
-    // most-recent /workspace snapshot before returning. ensureStarted
-    // blocks until the restore attempt is complete so the runner can't
-    // read or write /workspace mid-restore. Shared with the PTY
-    // upgrade and /exec paths so every "turn the sandbox on" entry
-    // point gets the same restore-first guarantee.
-    //
-    // setEnvVars below handles container-wide env propagation for
-    // subsequent exec/terminal calls; the envVars passed here populate
-    // the initial container process.
+    // Boot the sandbox runtime container AND restore the most-recent
+    // /workspace snapshot before returning. ensureStarted blocks until
+    // restore is complete so the dispatcher can't read or write
+    // /workspace mid-restore. Shared with the PTY upgrade and /exec
+    // paths.
     await this.ensureStarted(envVars);
 
     try {
@@ -440,44 +457,32 @@ export class Sandbox extends SandboxBase<Env> {
       );
     }
 
-    try {
-      // `ant beta:worker run` (formerly `ant worker dispatch`) reads the
-      // ANTHROPIC_* env vars we set above. `--unrestricted-paths` replaces
-      // the old `--allow-absolute-paths` flag.
-      const command =
-        "ant beta:worker run --workdir /workspace --unrestricted-paths --max-idle 60s --log-format json";
-      const proc = await this.startProcess(command, {
-        env: envVars,
-        cwd: "/workspace",
-      });
-      console.log(
-        `[sandbox] runner started session=${opts.sessionId} pid=${proc.id ?? "?"} status=${proc.status ?? "?"}`,
-      );
-    } catch (error) {
-      console.error(
-        `[sandbox] failed to launch runner for ${opts.sessionId}: ${toErrorMessage(error)}`,
-      );
-    }
-
-    // Kick off the custom-tool dispatcher inside this DO. It polls
-    // Anthropic for `agent.custom_tool_use` events and answers them
-    // with `env`-backed tool handlers — so cf_* / user-defined tools
-    // never need to traverse the container's network boundary.
-    // Awaited only for typecheck cleanliness — the dispatcher itself
-    // runs detached via `ctx.waitUntil` inside.
-    await this.startCustomToolDispatcher(opts);
+    // Start the dispatcher + heartbeat in this DO. Awaited only for
+    // typecheck cleanliness — both loops run detached via
+    // `ctx.waitUntil` inside.
+    await this.startDispatcher(opts);
   }
 
-  // Start the parallel custom-tool dispatcher for this session. Safe to
-  // call multiple times: an already-running dispatcher is aborted and
-  // restarted so a redeploy that changes the tool set takes effect on
-  // the next webhook (mirrors `IsolateRunner.start`'s drift logic, just
-  // without the drift comparison — the dispatcher is cheap enough that
-  // unconditional restart on every cold-boot is fine).
-  private async startCustomToolDispatcher(opts: DispatchOpts): Promise<void> {
+  // Spin up the per-session dispatcher + heartbeat loop. Safe to call
+  // multiple times: an already-running dispatcher is aborted before
+  // the new one starts so a redeploy that changes the tool catalog
+  // takes effect on the next webhook (mirrors `IsolateRunner.start`'s
+  // drift logic, without the drift comparison — cheap enough to
+  // restart unconditionally).
+  //
+  // Two loops run in parallel under the same controller:
+  //   - `runCustomToolDispatcher` reads the session event stream and
+  //     answers both stock and custom tool calls.
+  //   - `runHeartbeatLoop` keeps the platform's work-item lease alive
+  //     and tears the controller down when the platform signals
+  //     `state: stopping` (or a 4xx response means we lost the lease).
+  // When either loop exits we force-stop the work item so the lease
+  // releases cleanly — the equivalent of `EnvironmentWorker.handleItem()`
+  // returning in the SDK-recommended flow.
+  private async startDispatcher(opts: DispatchOpts): Promise<void> {
     if (!this.env.ANTHROPIC_ENVIRONMENT_KEY) {
       console.warn(
-        `[sandbox] ANTHROPIC_ENVIRONMENT_KEY not set — custom-tool dispatcher will not start session=${opts.sessionId}`,
+        `[sandbox] ANTHROPIC_ENVIRONMENT_KEY not set — dispatcher will not start session=${opts.sessionId}`,
       );
       return;
     }
@@ -489,18 +494,15 @@ export class Sandbox extends SandboxBase<Env> {
     const tools = buildCfTools({
       env: this.env,
       sessionId: opts.sessionId,
-      // `workspace` is intentionally omitted — Sandbox sessions have no
-      // DO-local workspace. screenshot / image_generate detect
-      // this and return image content blocks inline instead of writing
-      // to a workspace path.
+      // `workspace` is intentionally omitted — MicroVM sessions don't
+      // have a DO-local workspace. screenshot / image_generate detect
+      // that and return image content blocks inline.
     });
 
     // Browser CDP tools (browser_search / browser_execute). The factory
     // spins up a Worker isolate via the parent Worker's LOADER binding
-    // and calls BROWSER directly, so the container is uninvolved — the
-    // same code path the Isolate backend uses works here unchanged.
-    // Gated on the bindings being present so a deploy without them
-    // doesn't register placeholder tools.
+    // and calls BROWSER directly, so the container is uninvolved.
+    // Gated on the bindings being present.
     if (this.env.LOADER && this.env.BROWSER) {
       try {
         tools.push(
@@ -516,31 +518,18 @@ export class Sandbox extends SandboxBase<Env> {
       }
     }
 
-    // Stock toolset handlers (bash/read/write/edit/glob/grep). These
-    // answer `agent.tool_use` events directly from the DO via the
-    // Sandbox SDK, so a self-hosted environment that doesn't run
-    // `ant beta:worker run` (or runs it but it doesn't pick up the work
-    // for whatever reason) still gets its built-in `write` calls answered
-    // instead of hanging on `session.status_idle.stop_reason.requires_action`.
-    // The handlers exec into the same container the user's bash commands
-    // would target, so behaviour matches what the model expects.
+    // Stock toolset handlers (bash/read/write/edit/glob/grep) that
+    // delegate to the container via the Sandbox SDK. This is what
+    // makes the DO a complete replacement for `ant beta:worker run` —
+    // every `agent.tool_use` event now has a worker-side answer.
     const stockTools = buildMicrovmStockTools(this);
 
-    if (tools.length === 0 && stockTools.length === 0) {
-      console.log(
-        `[sandbox] no tools available for session=${opts.sessionId} — dispatcher not started`,
-      );
-      this.customDispatchCtrl = undefined;
-      return;
-    }
-
-    // Under the 0.96 SDK the environment key authenticates the session
-    // event stream as well as the worker flow — no separate API key
-    // required for events.stream / .list / .send.
-    //
-    // apiKey: null avoids the SDK's process.env backfill, which would
-    // send both bearer + x-api-key and trip the managed-agents 401.
-    // (Same rationale as `bearerClient` in src/webhooks.ts.)
+    // Under the 0.96 SDK the environment key authenticates the work
+    // queue, the event stream, the heartbeat endpoint, and the
+    // force-stop endpoint. `apiKey: null` avoids the SDK's process.env
+    // backfill, which would send both bearer + x-api-key and trip the
+    // managed-agents 401. (Same rationale as `bearerClient` in
+    // src/webhooks.ts.)
     const client = new Anthropic({
       apiKey: null,
       authToken: this.env.ANTHROPIC_ENVIRONMENT_KEY,
@@ -548,52 +537,78 @@ export class Sandbox extends SandboxBase<Env> {
     });
 
     console.log(
-      `[sandbox] dispatcher starting session=${opts.sessionId} custom=${tools
+      `[sandbox] dispatcher starting session=${opts.sessionId} work=${opts.workId} custom=${tools
         .map((t) => t.name)
         .join(",")} stock=${stockTools.map((t) => t.name).join(",")}`,
     );
 
-    // Detached run. The DO stays alive while the dispatcher polls;
-    // when `ctrl.signal` aborts (manual stop, activity-expired, or
-    // another dispatch on the same session restarts us) the dispatcher
-    // returns and we clear the controller.
+    // Detached run. The DO stays alive while either loop is in
+    // flight; `ctrl.signal` aborts both together. `Promise.allSettled`
+    // means a heartbeat failure (which calls `ctrl.abort()`) lets the
+    // dispatcher drain instead of leaving it dangling.
     //
     // `onInFlightChange` fires every time a tool starts or finishes.
     // While the count is > 0 we bump the container's activity timer
     // so a long-running `bash` (npm install, test suite) can't trigger
-    // the SESSION_IDLE_TTL reaper mid-call. setEnvVars() is a cheap
-    // round-trip the SDK uses as its activity-renewal pulse; we pass
-    // an empty object so the actual env stays unchanged.
+    // the SESSION_IDLE_TTL reaper mid-call.
+    const { workId, environmentId, sessionId } = opts;
     this.ctx.waitUntil(
-      runCustomToolDispatcher({
-        client,
-        sessionId: opts.sessionId,
-        tools,
-        stockTools,
-        signal: ctrl.signal,
-        onInFlightChange: (count) => {
-          if (count > 0) {
-            void this.renewContainerActivity().catch(() => {
-              // Best-effort. The dispatcher logs detailed errors;
-              // failure to renew just means we fall back to the
-              // standard activity-expired path.
-            });
-          }
-        },
-      })
-        .catch((error) => {
-          console.error(
-            `[sandbox] custom-tool dispatcher failed session=${opts.sessionId}: ${toErrorMessage(error)}`,
-          );
-        })
-        .finally(() => {
+      (async () => {
+        try {
+          await Promise.allSettled([
+            runCustomToolDispatcher({
+              client,
+              sessionId,
+              tools,
+              stockTools,
+              signal: ctrl.signal,
+              onInFlightChange: (count) => {
+                if (count > 0) {
+                  void this.renewContainerActivity().catch(() => {
+                    // Best-effort.
+                  });
+                }
+              },
+            }).catch((error) => {
+              console.error(
+                `[sandbox] dispatcher loop failed session=${sessionId}: ${toErrorMessage(error)}`,
+              );
+            }),
+            runHeartbeatLoop({
+              client,
+              workId,
+              environmentId,
+              signal: ctrl.signal,
+              abort: () => ctrl.abort(),
+              logPrefix: "[sandbox]",
+            }).catch((error) => {
+              console.error(
+                `[sandbox] heartbeat loop failed session=${sessionId} work=${workId}: ${toErrorMessage(error)}`,
+              );
+            }),
+          ]);
+        } finally {
           if (this.customDispatchCtrl === ctrl) {
             this.customDispatchCtrl = undefined;
           }
-          console.log(
-            `[sandbox] custom-tool dispatcher exited session=${opts.sessionId}`,
-          );
-        }),
+          // Force-stop the work item so the lease releases cleanly,
+          // regardless of why the loops exited. Best-effort: a 4xx
+          // here (item already stopped, etc.) is logged and swallowed.
+          // Equivalent of `EnvironmentWorker.handleItem()` returning.
+          try {
+            await client.beta.environments.work.stop(workId, {
+              environment_id: environmentId,
+              force: true,
+              betas: [ANTHROPIC_BETA],
+            });
+          } catch (error) {
+            console.warn(
+              `[sandbox] force-stop failed session=${sessionId} work=${workId}: ${toErrorMessage(error)}`,
+            );
+          }
+          console.log(`[sandbox] dispatcher exited session=${sessionId}`);
+        }
+      })(),
     );
   }
 }
