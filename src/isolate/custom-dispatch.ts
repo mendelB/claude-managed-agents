@@ -2,110 +2,141 @@ import type Anthropic from "@anthropic-ai/sdk";
 import type { BetaRunnableTool } from "@anthropic-ai/sdk/lib/tools/BetaRunnableTool";
 import { ANTHROPIC_BETA } from "../anthropic";
 
-// Why this file exists
-// --------------------
-// MicroVM-side dispatcher for `agent.custom_tool_use` events. The
-// `Sandbox` DO (src/microvm/sandbox.ts) imports this to answer cf_*
-// and user-defined custom tool calls; the container's
-// `ant beta:worker run` process owns the stock toolset
-// (`agent.tool_use`) but has no Worker-binding access, so the DO has
-// to answer customs out-of-band.
+// In-DO dispatcher for `agent.tool_use` and `agent.custom_tool_use`
+// session events. Used by the MicroVM Sandbox path
+// (src/microvm/sandbox.ts); the Isolate path runs the SDK's
+// `SessionToolRunner` directly, which already covers both kinds.
 //
-// Not used by the Isolate runner any more. Under the 0.96 SDK,
-// `SessionToolRunner` (`client.beta.sessions.events.toolRunner`)
-// dispatches BOTH `agent.tool_use` AND `agent.custom_tool_use`
-// events AND reconciles past events on every (re)connect, so the
-// Isolate path runs that alone. Keeping both was an attractive
-// nuisance: when the parallel dispatcher's view of `tools` was
-// momentarily incomplete it would post `tool "<name>" not implemented`
-// and beat the SDK runner's correct answer to the punch.
+// On the MicroVM backend this dispatcher is one half of the
+// "EnvironmentWorker substitute" — the other half is the work-item
+// heartbeat loop (src/heartbeat.ts), which holds the lease while the
+// dispatcher runs. The Sandbox DO composes both so the worker-side
+// architecture matches what the Anthropic self-hosted-sandboxes guide
+// recommends (one owner per session, claim → dispatch → stop), just
+// hand-rolled because the SDK's `EnvironmentWorker.handleItem` helper
+// requires Node and can't run in a Worker DO.
 //
-// What this module gives MicroVM that the SDK runner doesn't:
-//  1. Reconcile-across-disconnect: we walk session events on every
-//     stream reconnect and pre-answer custom_tool_use events that
-//     arrived while the DO was asleep (eviction, deploy, crash).
-//  2. Workers-DO-aware error handling: per-tool timeout, content-block
-//     formatting matching the SDK runner, and integration with a shared
-//     AbortController.
+// The dispatcher accepts two parallel tool registries — `tools` for
+// `agent.custom_tool_use` answered with `user.custom_tool_result`,
+// and `stockTools` for `agent.tool_use` answered with
+// `user.tool_result`. Keeping them separate avoids a stock name
+// (`write`) accidentally answering a custom call (and vice versa) when
+// the model emits the wrong event kind.
 //
-// Heartbeat and lifecycle ownership live in the container — this
-// module never touches the work item itself.
+// What this dispatcher gives the MicroVM DO that the SDK's
+// SessionToolRunner doesn't:
+//  1. Reconcile across DO eviction — walks session events on every
+//     stream reconnect and pre-answers tool calls that arrived while
+//     we were asleep. The SDK runner reconciles per-connection but
+//     doesn't survive a DO restart.
+//  2. `onInFlightChange` — exposes the in-flight count so the caller
+//     can renew the container's activity timer during long tool runs.
+//
+// Lifecycle ownership: the heartbeat loop and the dispatcher share an
+// AbortController, so a `state: stopping` from the platform or a
+// dispatcher-side error tears down both together.
 
 const TOOL_TIMEOUT_MS = 120_000;
 const STREAM_BACKOFF_START_MS = 500;
 const STREAM_BACKOFF_CAP_MS = 10_000;
 const SEND_RETRIES = 3;
 
-// Subset of the SDK's BetaManagedAgentsAgentCustomToolUseEvent shape we
-// actually consume. Keeping a local interface avoids importing from deep
-// SDK paths just to reach the type.
-interface CustomToolUseEvent {
-  type: "agent.custom_tool_use";
+// Local subset of the SDK event shapes — avoids importing from deep
+// SDK paths just to reach the types.
+interface ToolUseEvent {
+  type: "agent.tool_use" | "agent.custom_tool_use";
   id: string;
   name: string;
   input: Record<string, unknown>;
 }
-
-interface UserCustomToolResultEvent {
-  type: "user.custom_tool_result";
-  custom_tool_use_id: string;
+interface ResultEvent {
+  type: "user.tool_result" | "user.custom_tool_result";
+  tool_use_id?: string;
+  custom_tool_use_id?: string;
 }
-
-interface UnknownEvent {
-  type: string;
-}
-
-type SessionEvent = CustomToolUseEvent | UserCustomToolResultEvent | UnknownEvent;
+type SessionEvent = ToolUseEvent | ResultEvent | { type: string };
 
 export interface CustomDispatchOpts {
   client: Anthropic;
   sessionId: string;
+  // Custom tools (cf_*, user-defined). Answer `agent.custom_tool_use`
+  // events with `user.custom_tool_result`.
   tools: BetaRunnableTool[];
-  // Shared with the SDK SessionToolRunner's controller — aborting either side
-  // brings the whole runner down together. Required, not optional, so callers
-  // don't accidentally start a dispatcher with no shutdown path.
+  // Stock toolset (bash/read/write/edit/glob/grep). Answer
+  // `agent.tool_use` events with `user.tool_result`. Pass the result
+  // of `buildMicrovmStockTools()` to make the dispatcher self-
+  // sufficient on self-hosted envs; omit for legacy setups where some
+  // other process answers `agent.tool_use`.
+  stockTools?: BetaRunnableTool[];
   signal: AbortSignal;
+  // Notified after each in-flight count change (so 0 means "all
+  // settled"). The MicroVM Sandbox uses this to renew the container's
+  // activity timer so long-running tools don't get reaped mid-call.
+  onInFlightChange?: (count: number) => void;
 }
 
-// Run a parallel dispatcher for `agent.custom_tool_use` events. Returns when
-// `signal` aborts or a fatal stream error occurs. Caught errors are logged
-// and the stream reconnects with exponential backoff.
-export async function runCustomToolDispatcher(opts: CustomDispatchOpts): Promise<void> {
-  const { client, sessionId, tools, signal } = opts;
-  const toolByName = new Map(tools.map((t) => [t.name, t]));
-  const seen = new Set<string>();
-  const answered = new Set<string>();
+// Inspect an event and pull the (toolUseId, kind) it represents,
+// either as a tool_use that needs executing or a result we should
+// remember. Returning `null` means the event is unrelated to tool
+// dispatch (agent.message, idle, span events, …).
+function classifyEvent(ev: SessionEvent): {
+  toolUse?: ToolUseEvent;
+  answeredId?: string;
+} | null {
+  if (ev.type === "agent.tool_use" || ev.type === "agent.custom_tool_use") {
+    return { toolUse: ev as ToolUseEvent };
+  }
+  if (ev.type === "user.tool_result") {
+    return { answeredId: (ev as ResultEvent).tool_use_id };
+  }
+  if (ev.type === "user.custom_tool_result") {
+    return { answeredId: (ev as ResultEvent).custom_tool_use_id };
+  }
+  return null;
+}
 
-  // Reconcile first so any custom_tool_use events that arrived before the
-  // DO booted (or during a reconnect gap on the SDK side) get answered.
-  await reconcile({ client, sessionId, signal, toolByName, seen, answered });
+// Run the dispatcher against a session's event stream. Returns when
+// `signal` aborts. Stream errors are logged and the stream reconnects
+// with exponential backoff.
+export async function runCustomToolDispatcher(opts: CustomDispatchOpts): Promise<void> {
+  const ctx: Ctx = {
+    client: opts.client,
+    sessionId: opts.sessionId,
+    signal: opts.signal,
+    customToolByName: new Map(opts.tools.map((t) => [t.name, t])),
+    stockToolByName: new Map((opts.stockTools ?? []).map((t) => [t.name, t])),
+    seen: new Set(),
+    answered: new Set(),
+    inFlight: 0,
+    onInFlightChange: opts.onInFlightChange,
+  };
+
+  // Reconcile first so tool_use events that arrived before the DO
+  // booted (or during a reconnect gap) get picked up.
+  await reconcile(ctx);
 
   let backoff = STREAM_BACKOFF_START_MS;
-  while (!signal.aborted) {
+  while (!ctx.signal.aborted) {
     try {
-      const stream = await client.beta.sessions.events.stream(
-        sessionId,
+      const stream = await ctx.client.beta.sessions.events.stream(
+        ctx.sessionId,
         { betas: [ANTHROPIC_BETA] },
-        { signal },
+        { signal: ctx.signal },
       );
       for await (const ev of stream as AsyncIterable<SessionEvent>) {
-        if (signal.aborted) return;
+        if (ctx.signal.aborted) return;
         backoff = STREAM_BACKOFF_START_MS;
-        await handleEvent({ client, sessionId, signal, toolByName, seen, answered }, ev);
+        await handleEvent(ctx, ev);
       }
     } catch (error) {
-      if (signal.aborted) return;
+      if (ctx.signal.aborted) return;
       console.warn(
-        `[isolate][custom-dispatch] stream disconnected session=${sessionId}, reconnecting in ${backoff}ms: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `[microvm][custom-dispatch] stream disconnected session=${ctx.sessionId}, reconnecting in ${backoff}ms: ${errStr(error)}`,
       );
     }
-    if (signal.aborted) return;
-    // Reconcile across the disconnect window so we don't lose any events
-    // emitted while we were detached.
-    await reconcile({ client, sessionId, signal, toolByName, seen, answered });
-    await sleep(backoff, signal);
+    if (ctx.signal.aborted) return;
+    await reconcile(ctx);
+    await sleep(backoff, ctx.signal);
     backoff = Math.min(backoff * 2, STREAM_BACKOFF_CAP_MS);
   }
 }
@@ -114,35 +145,46 @@ interface Ctx {
   client: Anthropic;
   sessionId: string;
   signal: AbortSignal;
-  toolByName: Map<string, BetaRunnableTool>;
+  customToolByName: Map<string, BetaRunnableTool>;
+  stockToolByName: Map<string, BetaRunnableTool>;
   seen: Set<string>;
   answered: Set<string>;
+  inFlight: number;
+  onInFlightChange?: (count: number) => void;
+}
+
+function bumpInFlight(ctx: Ctx, delta: 1 | -1): void {
+  ctx.inFlight += delta;
+  try {
+    ctx.onInFlightChange?.(ctx.inFlight);
+  } catch (error) {
+    console.warn(
+      `[microvm][custom-dispatch] onInFlightChange threw session=${ctx.sessionId}: ${errStr(error)}`,
+    );
+  }
 }
 
 async function reconcile(ctx: Ctx): Promise<void> {
-  const pending: CustomToolUseEvent[] = [];
+  const pending: ToolUseEvent[] = [];
   try {
     for await (const ev of ctx.client.beta.sessions.events.list(
       ctx.sessionId,
       { limit: 1000, betas: [ANTHROPIC_BETA] },
       { signal: ctx.signal },
     ) as AsyncIterable<SessionEvent>) {
-      if (ev.type === "agent.custom_tool_use") {
-        const e = ev as CustomToolUseEvent;
-        if (!ctx.seen.has(e.id)) {
-          ctx.seen.add(e.id);
-          pending.push(e);
-        }
-      } else if (ev.type === "user.custom_tool_result") {
-        ctx.answered.add((ev as UserCustomToolResultEvent).custom_tool_use_id);
+      const c = classifyEvent(ev);
+      if (!c) continue;
+      if (c.toolUse && !ctx.seen.has(c.toolUse.id)) {
+        ctx.seen.add(c.toolUse.id);
+        pending.push(c.toolUse);
+      } else if (c.answeredId) {
+        ctx.answered.add(c.answeredId);
       }
     }
   } catch (error) {
     if (!ctx.signal.aborted) {
       console.warn(
-        `[isolate][custom-dispatch] reconcile failed session=${ctx.sessionId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `[microvm][custom-dispatch] reconcile failed session=${ctx.sessionId}: ${errStr(error)}`,
       );
     }
     return;
@@ -155,167 +197,157 @@ async function reconcile(ctx: Ctx): Promise<void> {
 }
 
 async function handleEvent(ctx: Ctx, ev: SessionEvent): Promise<void> {
-  if (ev.type === "agent.custom_tool_use") {
-    const e = ev as CustomToolUseEvent;
-    if (ctx.seen.has(e.id)) return;
-    ctx.seen.add(e.id);
-    await execute(ctx, e);
-  } else if (ev.type === "user.custom_tool_result") {
-    ctx.answered.add((ev as UserCustomToolResultEvent).custom_tool_use_id);
+  const c = classifyEvent(ev);
+  if (!c) return;
+  if (c.toolUse) {
+    if (ctx.seen.has(c.toolUse.id)) return;
+    ctx.seen.add(c.toolUse.id);
+    await execute(ctx, c.toolUse);
+  } else if (c.answeredId) {
+    ctx.answered.add(c.answeredId);
   }
-  // All other event types — agent.tool_use, agent.message, idle, etc — are
-  // either someone else's job (SDK dispatcher) or not actionable here.
 }
 
-async function execute(ctx: Ctx, ev: CustomToolUseEvent): Promise<void> {
-  console.log(
-    `[isolate][custom-dispatch] tool=${ev.name} start session=${ctx.sessionId} use_id=${ev.id}`,
-  );
+async function execute(ctx: Ctx, ev: ToolUseEvent): Promise<void> {
+  const isStock = ev.type === "agent.tool_use";
+  const lookup = isStock ? ctx.stockToolByName : ctx.customToolByName;
+  const kind = isStock ? "stock" : "custom";
   const start = Date.now();
-  const tool = ctx.toolByName.get(ev.name);
+  const tool = lookup.get(ev.name);
+  console.log(
+    `[microvm][custom-dispatch] kind=${kind} tool=${ev.name} start session=${ctx.sessionId} use_id=${ev.id}`,
+  );
 
+  bumpInFlight(ctx, 1);
   let content: string | unknown[];
   let isError: boolean;
-
-  if (!tool) {
-    // Hallucinated / stale tool name: the model emitted a
-    // custom_tool_use for a name the dispatcher doesn't recognise.
-    // Most common cause is a saved agent whose tools array still has
-    // an old name (or `read`/`write` without the `cf_` prefix). Log
-    // the known names alongside the rejection so the operator can
-    // confirm the catalog from Worker logs without having to add
-    // instrumentation. Match the SDK runner's wording ("not found")
-    // so both surfaces agree.
-    const known = [...ctx.toolByName.keys()].sort().join(",");
-    console.warn(
-      `[microvm][custom-dispatch] tool=${ev.name} not in dispatcher registry session=${ctx.sessionId} use_id=${ev.id} registered=${known || "(none)"}`,
-    );
-    content = `Error: Tool '${ev.name}' not found. Registered tools: ${known || "(none)"}`;
-    isError = true;
-  } else {
-    const toolCtrl = new AbortController();
-    const onParentAbort = () => toolCtrl.abort();
-    ctx.signal.addEventListener("abort", onParentAbort, { once: true });
-    const timer = setTimeout(() => toolCtrl.abort(), TOOL_TIMEOUT_MS);
-    try {
-      const input = tool.parse ? tool.parse(ev.input) : ev.input;
-      // `BetaToolRunContext.toolUse` is the new field name; the SDK
-      // keeps `toolUseBlock` as a deprecated alias. None of our handlers
-      // actually read it (they only use `signal`), so we just pass the
-      // raw custom_tool_use event through.
-      content = await tool.run(input, {
-        toolUse: ev,
-        signal: toolCtrl.signal,
-      } as unknown as Parameters<NonNullable<BetaRunnableTool["run"]>>[1]);
-      isError = false;
-    } catch (err) {
-      content = `Error: ${err instanceof Error ? err.message : String(err)}`;
+  try {
+    if (!tool) {
+      // Hallucinated/stale tool name. For `agent.tool_use` this most
+      // often means the operator hasn't wired up `stockTools`; for
+      // `agent.custom_tool_use` it's a saved agent referring to a tool
+      // we no longer register. Match the SDK runner's "not found"
+      // wording so both surfaces agree to the model.
+      const known = [...lookup.keys()].sort().join(",") || "(none)";
+      console.warn(
+        `[microvm][custom-dispatch] kind=${kind} tool=${ev.name} not in registry session=${ctx.sessionId} use_id=${ev.id} registered=${known}`,
+      );
+      content = `Error: Tool '${ev.name}' not found. Registered ${kind} tools: ${known}`;
       isError = true;
-    } finally {
-      clearTimeout(timer);
-      ctx.signal.removeEventListener("abort", onParentAbort);
+    } else {
+      ({ content, isError } = await runTool(ctx, tool, ev));
     }
+
+    const ms = Date.now() - start;
+    const sample =
+      typeof content === "string"
+        ? content.length > 80 ? `${content.slice(0, 80)}…` : content
+        : "(blocks)";
+    console.log(
+      `[microvm][custom-dispatch] kind=${kind} tool=${ev.name} done  session=${ctx.sessionId} ms=${ms} error=${isError} result=${JSON.stringify(sample)}`,
+    );
+    await postResult(ctx, ev, content, isError);
+  } finally {
+    bumpInFlight(ctx, -1);
   }
+}
 
-  const ms = Date.now() - start;
-  const sample =
-    typeof content === "string"
-      ? content.length > 80
-        ? `${content.slice(0, 80)}…`
-        : content
-      : "(blocks)";
-  console.log(
-    `[isolate][custom-dispatch] tool=${ev.name} done  session=${ctx.sessionId} ms=${ms} error=${isError} result=${JSON.stringify(sample)}`,
-  );
-
-  await postResult(ctx, ev.id, content, isError);
+async function runTool(
+  ctx: Ctx,
+  tool: BetaRunnableTool,
+  ev: ToolUseEvent,
+): Promise<{ content: string | unknown[]; isError: boolean }> {
+  const toolCtrl = new AbortController();
+  const onParentAbort = () => toolCtrl.abort();
+  ctx.signal.addEventListener("abort", onParentAbort, { once: true });
+  const timer = setTimeout(() => toolCtrl.abort(), TOOL_TIMEOUT_MS);
+  try {
+    const input = tool.parse ? tool.parse(ev.input) : ev.input;
+    const content = await tool.run(input, {
+      toolUse: ev,
+      signal: toolCtrl.signal,
+    } as unknown as Parameters<NonNullable<BetaRunnableTool["run"]>>[1]);
+    return { content, isError: false };
+  } catch (err) {
+    return { content: `Error: ${errStr(err)}`, isError: true };
+  } finally {
+    clearTimeout(timer);
+    ctx.signal.removeEventListener("abort", onParentAbort);
+  }
 }
 
 async function postResult(
   ctx: Ctx,
-  customToolUseId: string,
+  ev: ToolUseEvent,
   content: string | unknown[],
   isError: boolean,
 ): Promise<boolean> {
   const blocks = toContentBlocks(content);
+  const resultEvent = ev.type === "agent.tool_use"
+    ? { type: "user.tool_result", tool_use_id: ev.id, is_error: isError, content: blocks }
+    : { type: "user.custom_tool_result", custom_tool_use_id: ev.id, is_error: isError, content: blocks };
+
   let lastErr: unknown;
   for (let i = 0; i < SEND_RETRIES; i++) {
     if (ctx.signal.aborted) return false;
     try {
-      // The SDK's typed `events.send` only accepts a fixed param union; cast
-      // through `unknown` so we can post the custom_tool_result shape. This
-      // is the same escape hatch the audit module uses for the legacy
-      // tool_result path — see src/isolate/audit.ts.
+      // `events.send` is typed for a fixed param union; cast through
+      // `unknown` so we can post either result shape. Same escape
+      // hatch the audit module uses — see src/isolate/audit.ts.
       await ctx.client.beta.sessions.events.send(
         ctx.sessionId,
-        {
-          betas: [ANTHROPIC_BETA],
-          events: [
-            {
-              type: "user.custom_tool_result",
-              custom_tool_use_id: customToolUseId,
-              is_error: isError,
-              content: blocks,
-            },
-          ],
-        } as unknown as Parameters<typeof ctx.client.beta.sessions.events.send>[1],
+        { betas: [ANTHROPIC_BETA], events: [resultEvent] } as unknown as Parameters<typeof ctx.client.beta.sessions.events.send>[1],
         { signal: ctx.signal },
       );
-      ctx.answered.add(customToolUseId);
+      ctx.answered.add(ev.id);
       return true;
     } catch (err) {
       lastErr = err;
       const status = (err as { status?: number })?.status;
-      // 4xx except 408/429 is fatal — same retry policy the SDK's sendResult uses.
-      if (
-        typeof status === "number" &&
-        status >= 400 &&
-        status < 500 &&
-        status !== 408 &&
-        status !== 429
-      ) {
+      // 4xx except 408/429 is fatal — same policy as the SDK runner.
+      if (typeof status === "number" && status >= 400 && status < 500 && status !== 408 && status !== 429) {
         break;
       }
       await sleep((i + 1) * 1000, ctx.signal);
     }
   }
   console.error(
-    `[isolate][custom-dispatch] failed to send tool result session=${ctx.sessionId} use_id=${customToolUseId}: ${String(
-      lastErr,
-    )}`,
+    `[microvm][custom-dispatch] failed to send tool result session=${ctx.sessionId} use_id=${ev.id} kind=${ev.type}: ${errStr(lastErr)}`,
   );
   return false;
 }
 
-// Mirror the SDK dispatcher's toSessionContent — wrap a raw string into a
-// text block, pass through structured blocks as-is, ensure we never post an
-// empty content array (the API rejects it).
+// Mirror the SDK dispatcher's toSessionContent — wrap a raw string
+// into a text block, pass through structured blocks as-is, ensure we
+// never post an empty array (the API rejects it).
 function toContentBlocks(content: string | unknown[]): unknown[] {
   if (typeof content === "string") {
     return [{ type: "text", text: content || "(no output)" }];
   }
   const out = content.map((b) => {
     const blk = b as { type?: string; text?: string };
-    if (blk.type === "text") {
-      return { type: "text", text: blk.text || "(no output)" };
-    }
+    if (blk.type === "text") return { type: "text", text: blk.text || "(no output)" };
     if (blk.type === "image" || blk.type === "document") return b;
     return { type: "text", text: JSON.stringify(b) };
   });
   return out.length > 0 ? out : [{ type: "text", text: "(no output)" }];
 }
 
+function errStr(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) return resolve();
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
     const timer = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }

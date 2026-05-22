@@ -15,6 +15,7 @@ import {
 } from "./tools";
 import { buildCfTools, cfToolGroups } from "../tools/cf";
 import { ANTHROPIC_BETA } from "../anthropic";
+import { runHeartbeatLoop } from "../heartbeat";
 
 // Wrap each tool so calls log start/end with timings. Without this, a
 // hang anywhere in the dispatcher chain looks identical from the
@@ -59,13 +60,6 @@ function instrumentTools(
 // work via webhook, which calls `start()` again. Mirrors the MicroVM Sandbox
 // runner's behaviour. Forwarded to `SessionToolRunner` as `maxIdleMs`.
 const IDLE_MS = 60_000;
-
-// Heartbeat cadence for the work-item lease. The old SDK's `ToolDispatcher`
-// owned this internally; under the 0.96 SDK `SessionToolRunner` is dispatch-
-// only so we own the heartbeat. 20s gives the lease ~3x headroom against the
-// server's default 60s TTL — the same headroom the SDK's `EnvironmentWorker`
-// uses internally.
-const HEARTBEAT_INTERVAL_MS = 20_000;
 
 // Stable name passed to `runFiber()` so eviction recovery can match the
 // dispatcher fiber and re-establish it from persisted state.
@@ -510,6 +504,7 @@ export class IsolateRunner extends Agent<Env, IsolateSessionState> {
             environmentId,
             signal,
             abort: () => this.ctrl?.abort(),
+            logPrefix: "[isolate]",
           }).catch((error) => {
             console.error(
               `[isolate] heartbeat loop failed session=${sessionId} work=${workId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -698,79 +693,6 @@ async function drainSessionToolRunner(opts: {
     // yielded `DispatchedToolCall` because there's nothing actionable
     // to do with it here.
     void call;
-  }
-}
-
-// Hand-rolled work-item heartbeat loop. The old SDK's `ToolDispatcher`
-// owned this; `SessionToolRunner` is dispatch-only so the caller owns
-// the lease.
-//
-// Protocol (see `WorkHeartbeatParams` in the SDK types):
-//   - First heartbeat sends `expected_last_heartbeat: "NO_HEARTBEAT"`
-//     to claim an unclaimed lease.
-//   - Each subsequent heartbeat echoes back the server's previous
-//     `last_heartbeat` value for optimistic concurrency. A 412 means
-//     someone else claimed the lease — we bail and let the control plane exit.
-//   - The response's `state` field tells us when the platform wants the
-//     work item to stop (`stopping` / `stopped`); we call `abort()` on
-//     the shared controller so the dispatchers unwind.
-async function runHeartbeatLoop(opts: {
-  client: Anthropic;
-  workId: string;
-  environmentId: string;
-  signal: AbortSignal;
-  abort: () => void;
-}): Promise<void> {
-  let lastHeartbeat: string | null = null;
-  while (!opts.signal.aborted) {
-    try {
-      const response = await opts.client.beta.environments.work.heartbeat(
-        opts.workId,
-        {
-          environment_id: opts.environmentId,
-          expected_last_heartbeat: lastHeartbeat ?? "NO_HEARTBEAT",
-          betas: [ANTHROPIC_BETA],
-        },
-        { signal: opts.signal },
-      );
-      lastHeartbeat = response.last_heartbeat;
-      if (response.state === "stopping" || response.state === "stopped") {
-        console.log(
-          `[isolate] heartbeat state=${response.state} work=${opts.workId} — aborting runner`,
-        );
-        opts.abort();
-        return;
-      }
-      if (!response.lease_extended) {
-        console.warn(
-          `[isolate] heartbeat lease not extended work=${opts.workId} — aborting runner`,
-        );
-        opts.abort();
-        return;
-      }
-    } catch (error) {
-      if (opts.signal.aborted) return;
-      // 412 (precondition failed) means our `expected_last_heartbeat`
-      // didn't match — the lease moved on without us. 4xx generally is
-      // fatal; we abort the control plane and let the next webhook reclaim.
-      const status = (error as { status?: number })?.status;
-      if (typeof status === "number" && status >= 400 && status < 500) {
-        console.warn(
-          `[isolate] heartbeat ${status} work=${opts.workId} — aborting runner: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        opts.abort();
-        return;
-      }
-      console.warn(
-        `[isolate] heartbeat transient error work=${opts.workId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      // Fall through to the sleep; we'll retry on the next tick.
-    }
-    await sleep(HEARTBEAT_INTERVAL_MS, opts.signal);
   }
 }
 
