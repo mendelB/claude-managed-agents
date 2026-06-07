@@ -402,6 +402,21 @@ export class Sandbox extends SandboxBase<Env> {
       envVars.GITHUB_TOKEN = this.env.GITHUB_TOKEN;
     }
 
+    // git on Debian ships linked against libcurl3-gnutls, which treats the
+    // Cloudflare egress proxy's abnormal TLS close (curl error 56 'unexpected
+    // eof while reading') as a hard handshake failure even when the CA is
+    // trusted and the HTTP response was actually received. OpenSSL-linked
+    // tools (curl, openssl s_client) just warn and accept the response; git
+    // aborts. GIT_SSL_NO_VERIFY at the env-var level skips git's TLS
+    // verification entirely. Safe because the egress proxy IS the trust
+    // boundary — all outbound traffic is intercepted, inspected, and
+    // policy-checked at the Cloudflare network layer before reaching the
+    // public internet. The container has no other path out.
+    // Diagnosed 2026-06-07 — first dispatch after fixing GITHUB_TOKEN failed
+    // on `fatal: GnuTLS recv error (-110): The TLS connection was non-
+    // properly terminated.`
+    envVars.GIT_SSL_NO_VERIFY = "true";
+
     console.log(
       `[sandbox] dispatch session=${opts.sessionId} work=${opts.workId} envKeys=${Object.keys(envVars).join(",")}`,
     );
