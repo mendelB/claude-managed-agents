@@ -47,6 +47,25 @@ function bearerClient(env: Env, token: string, what: string): Anthropic {
   });
 }
 
+// API-key client — for `sk-ant-...` keys that authenticate as `x-api-key`,
+// not as `Authorization: Bearer`. The two credential surfaces in this
+// control plane (ANTHROPIC_API_KEY for per-session retrieve calls,
+// ANTHROPIC_ENVIRONMENT_KEY for the worker drainpoll flow) take different
+// header types. Mixing them up returns 401 silently — caught 2026-06-07
+// when every new session showed `failed to resolve backend ... 401` and
+// the sandbox runner went up but the spawn-control flow was decoupled
+// from agent metadata.
+function apiKeyClient(env: Env, token: string, what: string): Anthropic {
+  if (!token) {
+    throw new Error(`missing api key for ${what}`);
+  }
+  return new Anthropic({
+    apiKey: token,
+    authToken: null,
+    baseURL: resolveAnthropicBaseURL(env),
+  });
+}
+
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -163,7 +182,12 @@ export async function resolveBackend(
     return { backend, agentId: cached.agentId };
   }
   try {
-    const client = bearerClient(
+    // ANTHROPIC_API_KEY is the `sk-ant-...` format, NOT a JWT — it MUST be
+    // sent as `x-api-key`, not as `Authorization: Bearer`. The template's
+    // original `bearerClient` here returned 401 on every fresh session
+    // because Bearer + sk-ant-... is rejected. Switched to `apiKeyClient`
+    // 2026-06-07.
+    const client = apiKeyClient(
       env,
       env.ANTHROPIC_API_KEY,
       "ANTHROPIC_API_KEY",
