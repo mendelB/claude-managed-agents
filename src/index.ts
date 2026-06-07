@@ -41,6 +41,85 @@ export default {
       return handleWebhook(request, env);
     }
 
+    // Admin diag — read the runner process logs + status + env probe from a
+    // live sandbox container. Added 2026-06-07 because the `ant beta:worker
+    // run` runner is fire-and-forget today (only the launch result is
+    // captured); when bash tool_use events go unfilled, there's no visibility
+    // into WHY. Auth: WEBHOOK_SECRET in the X-Admin-Secret header.
+    //
+    //   GET /admin/sandbox/diag?session=sesn_...&cmd=ls /workspace
+    //
+    // cmd is optional — when set, runs that command via sandbox.exec and
+    // returns its result. When omitted, returns the process list + the
+    // tail of each process's logs + a small env probe.
+    if (url.pathname === "/admin/sandbox/diag") {
+      const provided = request.headers.get("x-admin-secret") || url.searchParams.get("secret");
+      if (!env.WEBHOOK_SECRET || provided !== env.WEBHOOK_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const sessionId = url.searchParams.get("session") ?? "";
+      if (!isSessionId(sessionId)) {
+        return Response.json({ error: "session= must be a valid session id" }, { status: 400 });
+      }
+      try {
+        const sandbox = getSessionSandbox(env, sessionId);
+        const cmd = url.searchParams.get("cmd");
+        if (cmd) {
+          const result = await (sandbox as any).exec(cmd, { timeout: 10_000 });
+          return Response.json({
+            session: sessionId,
+            command: cmd,
+            exitCode: result?.exitCode ?? null,
+            stdout: typeof result?.stdout === "string" ? result.stdout : null,
+            stderr: typeof result?.stderr === "string" ? result.stderr : null,
+          });
+        }
+        const procs = await (sandbox as any).listProcesses() as Array<{ id: string; command?: string; status?: string }>;
+        const procLogs: Array<{ id: string; command?: string; status?: string; stdoutTail: string; stderrTail: string }> = [];
+        for (const p of procs) {
+          let logs: { stdout?: string; stderr?: string } = {};
+          try {
+            logs = await (sandbox as any).getProcessLogs(p.id);
+          } catch (e: any) {
+            logs = { stdout: `(getProcessLogs failed: ${e?.message || e})`, stderr: "" };
+          }
+          procLogs.push({
+            id: p.id,
+            command: p.command,
+            status: p.status,
+            stdoutTail: typeof logs.stdout === "string" ? logs.stdout.slice(-4000) : "",
+            stderrTail: typeof logs.stderr === "string" ? logs.stderr.slice(-4000) : "",
+          });
+        }
+        // Quick env probe — confirm GITHUB_TOKEN + ANTHROPIC_ENVIRONMENT_KEY
+        // are actually visible in the runner's env. Doesn't print the values.
+        let envProbe: any = null;
+        try {
+          const r = await (sandbox as any).exec(
+            `printenv | grep -E '^(ANTHROPIC_|GITHUB_)' | awk -F= '{print $1\"=set(\"length($2)\" chars)\"}'`,
+            { timeout: 5_000 },
+          );
+          envProbe = {
+            exitCode: r?.exitCode ?? null,
+            stdout: typeof r?.stdout === "string" ? r.stdout : null,
+            stderr: typeof r?.stderr === "string" ? r.stderr : null,
+          };
+        } catch (e: any) {
+          envProbe = { error: e?.message || String(e) };
+        }
+        return Response.json({
+          session: sessionId,
+          processes: procLogs,
+          envProbe,
+        }, { headers: { "Cache-Control": "no-store" } });
+      } catch (error: any) {
+        return Response.json({
+          error: error?.message || String(error),
+          stack: typeof error?.stack === "string" ? error.stack.slice(0, 600) : undefined,
+        }, { status: 500 });
+      }
+    }
+
     // PTY terminal WebSocket upgrade. The frontend opens
     // `ws(s)://<host>/ws/terminal?session=<id>&cols=<n>&rows=<n>` and pipes
     // it to xterm.js. We forward the upgrade request to the matching
