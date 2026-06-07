@@ -391,6 +391,17 @@ export class Sandbox extends SandboxBase<Env> {
       ANTHROPIC_BASE_URL: opts.baseURL,
     };
 
+    // Forward GITHUB_TOKEN if the control plane has one. Self-hosted
+    // environments don't support the platform's `resources[]` repo mount
+    // (POST /v1/sessions returns 400 on resources), so the L3 agent has
+    // to clone its own repos from inside the sandbox. The token has to
+    // reach the container somehow — env-var forwarding from the control
+    // plane is the cleanest channel (cleaner than embedding in the task
+    // prompt, where it'd be stored in the session event stream).
+    if (this.env.GITHUB_TOKEN) {
+      envVars.GITHUB_TOKEN = this.env.GITHUB_TOKEN;
+    }
+
     console.log(
       `[sandbox] dispatch session=${opts.sessionId} work=${opts.workId} envKeys=${Object.keys(envVars).join(",")}`,
     );

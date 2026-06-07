@@ -38,5 +38,14 @@ declare namespace Cloudflare {
     // catch-all route. When unset, unroutable mail is dropped after
     // logging.
     EMAIL_FORWARD?: string;
+
+    // Per-session sandbox env forwards. Self-hosted environments don't
+    // support the Anthropic `resources` parameter (POST /v1/sessions
+    // returns 400 invalid_request_error), so repos can't be mounted by
+    // the platform. Instead the L3 agent clones them itself from inside
+    // the sandbox; the control plane forwards this GitHub credential
+    // into the container's env so the agent's bootstrap can authenticate.
+    // Set via `wrangler secret put GITHUB_TOKEN` against the control plane.
+    GITHUB_TOKEN?: string;
   }
 }
