@@ -426,6 +426,56 @@ export class Sandbox extends SandboxBase<Env> {
       );
     }
 
+    // Install the Cloudflare egress TLS intercept CA into the container's
+    // trust store BEFORE starting the runner. The control plane's outbound
+    // policy intercepts HTTPS at the network layer; the sandbox sees a cert
+    // signed by "Cloudflare TLS proxy-everything Intercept CA" for every
+    // outbound host. That CA is NOT in the standard Debian bundle (147 certs,
+    // none of which are Cloudflare's), so Go's net/http rejects the handshake
+    // with `x509: certificate signed by unknown authority`. ant beta:worker
+    // run is Go-compiled, so it hits this every time and stalls — the model
+    // submits agent.tool_use, the runner can't reach Anthropic to claim or
+    // post results, the session sits in requires_action forever.
+    //
+    // Curl + openssl trust the CA somehow (BoringSSL build with embedded
+    // root? legacy bundle path?), but Go's SystemCertPool only reads
+    // /etc/ssl/certs/ca-certificates.crt — adding the CA there and running
+    // update-ca-certificates makes Go trust it too.
+    //
+    // The CA can't be baked into the Dockerfile because the cert chain is
+    // only visible from inside the sandbox at runtime (build happens locally
+    // where api.anthropic.com hits Anthropic's real CA). Extracting via
+    // openssl s_client at boot is the cleanest channel.
+    //
+    // Diagnosed 2026-06-07 — first real L3 dispatch sat in requires_action
+    // for 60 minutes before the MendelBot watchdog timed it out.
+    const caInstall = [
+      "set -e",
+      // Capture the live cert chain — bash heredoc + openssl s_client.
+      "echo Q | openssl s_client -showcerts -connect api.anthropic.com:443 -servername api.anthropic.com 2>/dev/null > /tmp/cf_chain.txt",
+      // Split into per-cert PEM files. The awk reopens output on each BEGIN.
+      "awk '/-----BEGIN CERTIFICATE-----/{c++; out=\"/tmp/cf_chain_\" c \".pem\"} c{print > out}' /tmp/cf_chain.txt",
+      // Find the Cloudflare-issued CA (depth=1 in the chain) and install.
+      "for f in /tmp/cf_chain_*.pem; do",
+      "  if openssl x509 -in \"$f\" -noout -issuer 2>/dev/null | grep -q Cloudflare; then",
+      "    cat \"$f\" > /usr/local/share/ca-certificates/cf-intercept.crt",
+      "  fi",
+      "done",
+      "update-ca-certificates >/dev/null 2>&1 || true",
+      // Print result for control-plane logs.
+      "echo CA-install:$(grep -c 'BEGIN CERT' /etc/ssl/certs/ca-certificates.crt) certs in bundle",
+    ].join("\n");
+    try {
+      const caResult = await (this as any).exec(caInstall, { timeout: 10_000 });
+      console.log(
+        `[sandbox] CA install session=${opts.sessionId} exit=${caResult?.exitCode ?? "?"} out=${(caResult?.stdout || "").trim()}`,
+      );
+    } catch (error) {
+      console.warn(
+        `[sandbox] CA install failed for ${opts.sessionId}: ${toErrorMessage(error)} — runner will likely fail TLS to api.anthropic.com`,
+      );
+    }
+
     try {
       // `ant beta:worker run` (formerly `ant worker dispatch`) reads the
       // ANTHROPIC_* env vars we set above. `--unrestricted-paths` replaces
