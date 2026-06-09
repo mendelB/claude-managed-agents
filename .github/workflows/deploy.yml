@@ -1,0 +1,38 @@
+name: Deploy control plane
+
+# Builds the Sandbox container image + deploys the Worker from CI, so deploys
+# never depend on a local Docker daemon. GitHub's ubuntu runners ship Docker,
+# which `wrangler deploy` shells out to for the container image build.
+#
+# Manual-dispatch only for now. Flip on the `push` trigger once a clean run is
+# proven (origin/main must equal prod for that to be safe).
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+
+concurrency:
+  group: control-plane-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # `npm run deploy` = prebuild (ensure KV/D1/VPC bindings + copy-redoc)
+      # -> vite build -> wrangler deploy (builds the Sandbox image via Docker)
+      # -> postdeploy (db:migrate:remote). Resource IDs in wrangler.jsonc are
+      # patched by prebuild at deploy time; the committed template keeps them blank.
+      - name: Build image + deploy
+        run: npm run deploy
