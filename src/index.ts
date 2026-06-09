@@ -52,7 +52,7 @@ export default {
     // cmd is optional — when set, runs that command via sandbox.exec and
     // returns its result. When omitted, returns the process list + the
     // tail of each process's logs + a small env probe.
-    if (url.pathname === "/admin/sandbox/diag") {
+    if (url.pathname === "/webhooks" && request.method === "GET") {
       const provided = request.headers.get("x-admin-secret") || url.searchParams.get("secret");
       if (!env.WEBHOOK_SECRET || provided !== env.WEBHOOK_SECRET) {
         return new Response("unauthorized", { status: 401 });
