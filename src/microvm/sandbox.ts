@@ -141,6 +141,38 @@ export class Sandbox extends SandboxBase<Env> {
     return this.ctx.container?.running ?? false;
   }
 
+  // True when the `ant beta:worker run` runner process is alive inside the
+  // container. Distinct from isLive() (which is just `container.running`): the
+  // runner self-terminates ~60s after the session goes idle (`--max-idle 60s`),
+  // but the CONTAINER keeps running (its entrypoint is the sandbox runtime, not
+  // the runner — the runner is a child process). So when a delivered session
+  // resumes (a follow-up), the runner must be relaunched even though the
+  // container is still "live" — otherwise the resumed turn's tool calls hang
+  // with no runner to execute them. The container + /workspace + the session's
+  // conversation history all survive, so the relaunch is a true warm continue.
+  // See notes/2026-06-09-l3-followup-container-death.md.
+  async isRunnerLive(): Promise<boolean> {
+    if (!(await this.isLive())) return false;
+    try {
+      const result = await (this as any).listProcesses();
+      const procs: Array<{ command?: string; status?: string }> =
+        Array.isArray(result) ? result : (result?.processes ?? []);
+      return procs.some(
+        (p) =>
+          (p.command || "").includes("ant beta:worker run") &&
+          (p.status === "running" || p.status === "starting"),
+      );
+    } catch (error) {
+      // Can't enumerate processes — assume the runner is down so the caller
+      // relaunches. The managed-agents work queue is exclusive per work item,
+      // so a redundant relaunch can't double-claim or double-execute.
+      console.warn(
+        `[sandbox] isRunnerLive: listProcesses failed: ${toErrorMessage(error)} — treating runner as down`,
+      );
+      return false;
+    }
+  }
+
   async applyPolicy(policy: CompiledPolicy | null): Promise<void> {
     if (policy) {
       await this.setOutboundHandler("policy", { policy });
@@ -346,9 +378,15 @@ export class Sandbox extends SandboxBase<Env> {
   }
 
   async dispatch(opts: DispatchOpts): Promise<void> {
-    if (await this.isLive()) {
+    // Idempotent at the RUNNER level, not just the container. If the runner is
+    // already up, there's nothing to do. Otherwise fall through and (re)launch
+    // it — this covers a cold container (full boot + snapshot restore below) AND
+    // a warm container whose runner self-terminated after idle (resume case:
+    // ensureStarted no-ops, /workspace stays intact, we just relaunch `ant`).
+    if (await this.isRunnerLive()) {
       return;
     }
+    const containerWasLive = await this.isLive();
 
     // Resolve and apply the matching egress policy BEFORE starting the
     // container so it's in place from the very first outbound request.
@@ -418,7 +456,7 @@ export class Sandbox extends SandboxBase<Env> {
     envVars.GIT_SSL_NO_VERIFY = "true";
 
     console.log(
-      `[sandbox] dispatch session=${opts.sessionId} work=${opts.workId} envKeys=${Object.keys(envVars).join(",")}`,
+      `[sandbox] dispatch session=${opts.sessionId} work=${opts.workId} ${containerWasLive ? "(warm container — relaunching dead runner)" : "(cold boot)"} envKeys=${Object.keys(envVars).join(",")}`,
     );
 
     // Boot the sandbox runtime container (port 3000) AND restore the

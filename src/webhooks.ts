@@ -304,8 +304,15 @@ export async function drainWork(env: Env): Promise<DrainResult[]> {
     }
 
     const stub = getSessionSandbox(env, sessionId);
-    const wasLive = await stub.isLive();
-    if (!wasLive) {
+    // Guard on the RUNNER, not just the container. The `ant` runner
+    // self-terminates ~60s after a session goes idle, while the container stays
+    // up for SESSION_IDLE_TTL (3m) — so an isLive()-only skip left a resumed
+    // session (a follow-up) with a live container but no runner, and its tool
+    // calls hung until the watchdog. dispatch() relaunches the runner in the
+    // warm container (/workspace + conversation history intact — a true warm
+    // continue). See notes/2026-06-09-l3-followup-container-death.md.
+    const runnerWasLive = await stub.isRunnerLive();
+    if (!runnerWasLive) {
       await stub.dispatch({
         sessionId,
         workId: work.id,
@@ -317,7 +324,7 @@ export async function drainWork(env: Env): Promise<DrainResult[]> {
     spawned.push({
       session_id: sessionId,
       work_id: work.id,
-      created: !wasLive,
+      created: !runnerWasLive,
     });
   }
 
