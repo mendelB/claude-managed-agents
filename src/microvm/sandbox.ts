@@ -11,11 +11,14 @@ import { isolateBrowserTools } from "../isolate/tools";
 
 // How long the MicroVM container stays alive after the agent goes idle
 // before the base Container class snapshots /workspace and stops it.
-// Short by default so we don't keep MicroVMs warm longer than needed;
-// override per deployment in wrangler.jsonc / sandbox.ts if your sessions
-// burst back to life often and you'd rather pay for warmth than cold
-// boots.
-export const SESSION_IDLE_TTL = "3m";
+// How long the container stays warm after going idle. This is the window in
+// which an L3 follow-up resumes INSTANTLY (warm container, /workspace intact,
+// runner relaunched). Past it, a follow-up still works on the same session — it
+// cold-boots and restores the /workspace snapshot from R2 (held 7d) — just with
+// a ~20-30s re-boot. Set generous so human-paced follow-ups (reply after
+// stepping away) stay snappy; at L3 review volume the idle-warmth cost is
+// trivial. Tune down if container concurrency ever becomes the constraint.
+export const SESSION_IDLE_TTL = "30m";
 
 // Workspace directory the snapshots cover. The Sandbox SDK enforces that
 // backup paths live under one of /workspace, /home, /tmp, /var/tmp, or
