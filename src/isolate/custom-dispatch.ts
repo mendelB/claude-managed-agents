@@ -178,21 +178,25 @@ async function execute(ctx: Ctx, ev: CustomToolUseEvent): Promise<void> {
   let isError: boolean;
 
   if (!tool) {
-    // Hallucinated / stale tool name: the model emitted a
-    // custom_tool_use for a name the dispatcher doesn't recognise.
-    // Most common cause is a saved agent whose tools array still has
-    // an old name (or `read`/`write` without the `cf_` prefix). Log
-    // the known names alongside the rejection so the operator can
-    // confirm the catalog from Worker logs without having to add
-    // instrumentation. Match the SDK runner's wording ("not found")
-    // so both surfaces agree.
+    // Not ours — skip, do NOT post a result. This dispatcher is no longer the
+    // sole fulfiller of custom_tool_use on a session: the container `ant`
+    // runner answers them too, and for some agents an EXTERNAL orchestrator
+    // owns custom tools this dispatcher has never heard of (e.g. MendelBot's
+    // L3 reviewer fulfilling its `ctx_*` context tools out-of-band over the
+    // session event stream). Posting a "not found" result for a tool we don't
+    // own races that fulfiller and poisons the model with a spurious error
+    // alongside the real answer — see
+    // notes/2026-06-08-l3-custom-tool-triple-fulfillment-bug.md. Answer ONLY
+    // tools in our registry; leave the rest for whoever owns them. A genuinely
+    // hallucinated tool with no fulfiller anywhere still gets the container
+    // runner's own error, and the L1 watchdog is the final backstop.
     const known = [...ctx.toolByName.keys()].sort().join(",");
-    console.warn(
-      `[microvm][custom-dispatch] tool=${ev.name} not in dispatcher registry session=${ctx.sessionId} use_id=${ev.id} registered=${known || "(none)"}`,
+    console.log(
+      `[isolate][custom-dispatch] tool=${ev.name} not ours — skipping (registered=${known || "(none)"}) session=${ctx.sessionId} use_id=${ev.id}`,
     );
-    content = `Error: Tool '${ev.name}' not found. Registered tools: ${known || "(none)"}`;
-    isError = true;
-  } else {
+    return;
+  }
+  {
     const toolCtrl = new AbortController();
     const onParentAbort = () => toolCtrl.abort();
     ctx.signal.addEventListener("abort", onParentAbort, { once: true });
