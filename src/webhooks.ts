@@ -440,6 +440,45 @@ export async function handleWebhook(
         return Response.json({ status: "ok", drainError: true });
       }
     }
+    case "session.requires_action": {
+      // A session emitted a tool_use and is waiting for its runner to execute
+      // it. For a healthy session the runner is live and there's nothing to do.
+      // For a bootstrap-stalled session (runner never launched, died, or can't
+      // reach Anthropic) this is the EARLIEST possible signal — it fires the
+      // instant the stall begins, vs the ≤2-min drain cron. Guard on the
+      // runner so we don't drain on every healthy tool wait: only when THIS
+      // session's runner is dead do we drainWork() to re-dispatch it. Safe —
+      // the work queue is exclusive per item, so a re-dispatch can't
+      // double-claim, and dispatch() early-returns on a live runner.
+      if (sessionId) {
+        try {
+          const { backend } = await resolveBackend(env, sessionId);
+          const runnerLive =
+            backend === "microvm"
+              ? await getSessionSandbox(env, sessionId).isRunnerLive()
+              : await getIsolateRunner(env, sessionId).isLive();
+          if (!runnerLive) {
+            console.log(
+              `[webhook] action=drainWork ${eventSummary} reason=requires_action+runner-dead`,
+            );
+            const spawned = await drainWork(env);
+            console.log(
+              `[webhook] action=drainWork complete ${eventSummary} spawned=${spawned.length}`,
+            );
+            return Response.json({ status: "ok", spawned });
+          }
+          console.log(`[webhook] action=runner-live ${eventSummary}`);
+        } catch (error) {
+          console.error(
+            `[webhook] requires_action handling failed ${eventSummary}`,
+            error,
+          );
+          // Already persisted above — return 200 so Anthropic doesn't retry.
+          return Response.json({ status: "ok", drainError: true });
+        }
+      }
+      break;
+    }
     case "session.status_terminated":
     case "session.status_idled": {
       // Capture /workspace to R2 now rather than waiting for the base
