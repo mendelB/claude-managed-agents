@@ -4,7 +4,7 @@ import { buildOpenApiSpec } from "./api/openapi";
 import { Sandbox, getSessionSandbox } from "./microvm/sandbox";
 import { IsolateRunner } from "./isolate/runner";
 import { IsolateOutboundGateway } from "./isolate/gateway";
-import { handleWebhook, resolveBackend } from "./webhooks";
+import { handleWebhook, resolveBackend, drainWork } from "./webhooks";
 import { isSessionId } from "./helpers";
 import { pruneOlderThan } from "./storage";
 import { handleEmail, type ForwardableEmailMessage } from "./email-handler";
@@ -235,13 +235,41 @@ export default {
     ctx.waitUntil(handleEmail(message, env));
   },
 
-  // Daily prune of webhook_events and sessions older than 24h. Configured in
-  // wrangler.jsonc as `0 4 * * *` (4 AM UTC).
+  // Two cron triggers (see wrangler.jsonc):
+  //   */2 * * * *  → fast drain (runner-launch watchdog)
+  //   0 4 * * *    → daily prune of webhook_events + sessions older than 24h
   async scheduled(
-    _controller: ScheduledController,
+    controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
+    // Fast drain. Runner-launch must NOT depend on the inbound
+    // session.status_run_started webhook: that subscription is Console-managed
+    // and can silently stop delivering (it did — see
+    // ../../docs/plans/2026-06-29-l3-runner-liveness-watchdog-design.md), which
+    // strands every session in requires_action because drainWork never fires.
+    // Polling the work queue on a timer makes launch webhook-independent — work.poll
+    // only returns unclaimed/reclaimable work and dispatch() no-ops on a live runner,
+    // so a healthy session is untouched; a stranded one is re-dispatched within ~2m.
+    if (controller.cron === "*/2 * * * *") {
+      ctx.waitUntil(
+        (async () => {
+          try {
+            const spawned = await drainWork(env);
+            const created = spawned.filter((s) => s.created).length;
+            if (created > 0) {
+              console.log(
+                `[cron] drain spawned=${created}/${spawned.length} (webhook-independent launch)`,
+              );
+            }
+          } catch (error) {
+            console.error("[cron] drain failed", error);
+          }
+        })(),
+      );
+      return;
+    }
+
     const cutoff = Date.now() - ONE_DAY_MS;
     ctx.waitUntil(
       (async () => {

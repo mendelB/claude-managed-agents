@@ -160,9 +160,9 @@
       "tag": "v1",
     },
   ],
-  // Daily cleanup of webhook_events and sessions older than 24h.
+  // */2 → fast drain (webhook-independent runner-launch watchdog); 0 4 → daily cleanup.
   "triggers": {
-    "crons": ["0 4 * * *"],
+    "crons": ["*/2 * * * *", "0 4 * * *"],
   },
   // VPC + Mesh — declare bindings here when you want egress policies to be
   // able to attach a VPC service or network to a sandbox.
