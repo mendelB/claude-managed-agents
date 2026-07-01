@@ -34,12 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the session's agent skills and mounts them under `/workspace/skills/<name>/`
 # before any tool runs (see the 0512 self-hosted integration guide).
 # ---------------------------------------------------------------------------
-ARG ANT_SHA=0058203228b4165d10d29ba225b8ff3053f6ac83
-ADD https://app.stainless.com/pkg/s/anthropic-cli/${ANT_SHA}/dist.zip /tmp/ant.zip
-
-RUN DIR=$([ "$TARGETARCH" = "arm64" ] && echo linux_linux_arm64_v8.0 || echo linux_linux_amd64_v1) \
- && unzip -oj /tmp/ant.zip "${DIR}/ant" -d /usr/local/bin \
- && chmod +x /usr/local/bin/ant && rm /tmp/ant.zip
+ARG ANT_VERSION=1.9.1
+# TARGETARCH is a BuildKit-provided global ARG (amd64 / arm64), but it has to
+# be redeclared inside the stage before it expands in `RUN`.
+ARG TARGETARCH
+RUN curl -fsSL "https://github.com/anthropics/anthropic-cli/releases/download/v${ANT_VERSION}/ant_${ANT_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin ant \
+ && chmod +x /usr/local/bin/ant
 
 WORKDIR /workspace
 RUN mkdir -p /workspace

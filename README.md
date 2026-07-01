@@ -15,6 +15,7 @@ deployment styles are supported: a one-click Deploy to Cloudflare
 button (git-based, runs in Workers Builds) and a terminal-based
 `npm run deploy` flow from your laptop.
 
+> [!IMPORTANT]
 > **You need a Paid or Enterprise Cloudflare account to run Managed Agents.**
 > [Cloudflare Containers](https://developers.cloudflare.com/containers/)
 > (used by the MicroVM sandbox) and Worker Loader bindings (used by the
@@ -56,9 +57,16 @@ With the repository you should be able to get a Cloudflare-based self-managed en
 running quickly. Then you can fork it, customize it to suit your needs, and redeploy. This repository is
 meant as a starting point.
 
+> [!IMPORTANT]
+> You should consider this repository alpha software. It is not yet stable and may contain bugs.
+
 ## Onboarding guide
 
 Order matters — work through the steps top to bottom.
+
+> [!IMPORTANT]
+> Step 8 is vital to securing your workload in production. Until you add auth,
+> anybody with access to your Workers URL can start sessions via the Claude Platform.
 
 ### Pick a deployment style
 There are two ways to deploy. Pick one and stick with it for the whole onboarding:
@@ -231,7 +239,7 @@ the `r2_buckets` block from `wrangler.jsonc`).
 Anyone running the MicroVM backend should treat this as core
 onboarding.
 
-[Mint an R2 access key](https://dash.cloudflare.com/r2/api-tokens/create?type=user)
+[Mint an R2 access key](https://dash.cloudflare.com?to=/:account/r2/api-tokens/create?type=user)
 with read+write on the `claude-managed-agents-snapshots` bucket
 (Cloudflare dashboard → R2 → Manage R2 API Tokens → Create token),
 copy the Access Key ID and Secret Access Key, then push the

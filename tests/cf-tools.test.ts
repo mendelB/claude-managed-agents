@@ -1,4 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// `src/vpc.generated.ts` is produced at build time from wrangler.jsonc and
+// is empty in a clean checkout. The case-insensitive binding tests below
+// need a known service binding (VPC_SERVICE) to exist, so we inject one via
+// a module mock rather than relying on whatever the local build happens
+// to have generated. Hoisted by vitest so it lands before the imports
+// that pull VPC_BINDINGS transitively.
+vi.mock("../src/vpc.generated", () => ({
+  VPC_BINDINGS: [
+    { binding: "VPC_SERVICE", type: "service", id: "test-service-id" },
+  ],
+}));
+
 import {
   CF_TOOL_DEFS,
   buildCfTools,
@@ -421,41 +434,41 @@ describe("cfToolGroups", () => {
 // step that maps any casing back to the canonical binding name.
 describe("buildCfCallServiceSchema (case-insensitive binding)", () => {
   it("accepts a lowercase binding and normalises to canonical", () => {
-    // VPC_BINDINGS.generated.ts ships with RESPONDY; ensure the env has
-    // a matching fetcher so availableVpcServiceBindings picks it up.
+    // VPC_BINDINGS is mocked above to include VPC_SERVICE; ensure the env
+    // has a matching fetcher so availableVpcServiceBindings picks it up.
     const env = makeBaseEnv({
-      RESPONDY: { fetch: () => new Response("ok") },
+      VPC_SERVICE: { fetch: () => new Response("ok") },
     });
     const built = buildCfCallServiceSchema(env);
     expect(built).not.toBeNull();
     const parsed = built!.schema.safeParse({
-      binding: "respondy",
+      binding: "vpc_service",
       path: "/",
     });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.binding).toBe("RESPONDY");
+      expect(parsed.data.binding).toBe("VPC_SERVICE");
     }
   });
 
   it("accepts mixed case and normalises to canonical", () => {
     const env = makeBaseEnv({
-      RESPONDY: { fetch: () => new Response("ok") },
+      VPC_SERVICE: { fetch: () => new Response("ok") },
     });
     const built = buildCfCallServiceSchema(env)!;
     const parsed = built.schema.safeParse({
-      binding: "ResPondY",
+      binding: "VpC_SerViCe",
       path: "/",
     });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.binding).toBe("RESPONDY");
+      expect(parsed.data.binding).toBe("VPC_SERVICE");
     }
   });
 
   it("still rejects unknown binding names", () => {
     const env = makeBaseEnv({
-      RESPONDY: { fetch: () => new Response("ok") },
+      VPC_SERVICE: { fetch: () => new Response("ok") },
     });
     const built = buildCfCallServiceSchema(env)!;
     const parsed = built.schema.safeParse({
