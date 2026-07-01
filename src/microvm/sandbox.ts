@@ -42,6 +42,15 @@ const SNAPSHOT_KEY = "latest_snapshot";
 // long a stale snapshot can sit there before being GC'd.
 const SNAPSHOT_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+// The Cloudflare egress proxy MITMs all outbound HTTPS (interceptHttps =
+// true), re-signing every host with its own "Cloudflare TLS
+// proxy-everything Intercept CA". The platform mounts that CA at this path
+// inside every container but does NOT add it to any system trust store, so
+// TLS clients reject the re-signed certs as self-signed unless pointed here
+// explicitly — see the CA env-var forwarding in dispatch().
+const EGRESS_INTERCEPT_CA_PATH =
+  "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
+
 export interface DispatchOpts {
   sessionId: string;
   workId: string;
@@ -119,9 +128,11 @@ export class Sandbox extends SandboxBase<Env> {
   override sleepAfter = SESSION_IDLE_TTL;
   // Intercept HTTPS so the egress proxy can see TLS traffic too — without
   // this, only port 80 traffic flows through the policy handler and HTTPS
-  // bypasses egress entirely. The platform mounts a CA at
-  // /etc/cloudflare/certs/cloudflare-containers-ca.crt and the sandbox
-  // runtime auto-trusts it for curl/Node/Python/Git on startup.
+  // bypasses egress entirely. The platform mounts the intercept CA at
+  // EGRESS_INTERCEPT_CA_PATH but does NOT add it to any system trust store,
+  // so curl/Node/Python/Go reject the re-signed certs as self-signed until
+  // each client is pointed at that file — see the CA env-var forwarding in
+  // dispatch().
   // https://developers.cloudflare.com/sandbox/guides/outbound-traffic/#https-traffic
   override interceptHttps = true;
 
@@ -466,6 +477,28 @@ export class Sandbox extends SandboxBase<Env> {
     // on `fatal: GnuTLS recv error (-110): The TLS connection was non-
     // properly terminated.`
     envVars.GIT_SSL_NO_VERIFY = "true";
+
+    // Trust the egress proxy's intercept CA for every non-git TLS client.
+    // The CA is mounted at EGRESS_INTERCEPT_CA_PATH but absent from the
+    // system trust store, so unconfigured clients reject it: curl fails
+    // "self-signed certificate in certificate chain" (error 60), Node/npm
+    // "fetch failed", Go tools (gh) "x509: unknown authority". Unlike
+    // GIT_SSL_NO_VERIFY above (which SKIPS git's verification to dodge its
+    // GnuTLS error-56 abort), these KEEP verification on and trust the real
+    // intercept CA — the proxy IS the trust boundary, so verified TLS
+    // against it is correct. Each var covers a different client family:
+    //   CURL_CA_BUNDLE      — curl
+    //   NODE_EXTRA_CA_CERTS — Node / npm (additive to Node's built-in roots)
+    //   SSL_CERT_FILE       — OpenSSL + Go's SystemCertPool (gh, python ssl)
+    //   REQUESTS_CA_BUNDLE  — python requests / pip (HART-side dispatches)
+    // Set unconditionally — the CA is always mounted when interceptHttps is
+    // on, which is always. Diagnosed 2026-07-01: after the DO-native merge
+    // dropped the boot-time `update-ca-certificates` install, curl/Node
+    // failed until pointed here; each returns HTTP 200 with these set.
+    envVars.CURL_CA_BUNDLE = EGRESS_INTERCEPT_CA_PATH;
+    envVars.NODE_EXTRA_CA_CERTS = EGRESS_INTERCEPT_CA_PATH;
+    envVars.SSL_CERT_FILE = EGRESS_INTERCEPT_CA_PATH;
+    envVars.REQUESTS_CA_BUNDLE = EGRESS_INTERCEPT_CA_PATH;
 
     console.log(
       `[sandbox] dispatch session=${opts.sessionId} work=${opts.workId} envKeys=${Object.keys(envVars).join(",")}`,
